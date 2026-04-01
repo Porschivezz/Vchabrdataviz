@@ -1,9 +1,15 @@
-"""VC.ru scraper using the public JSON API — date-range based."""
+"""VC.ru scraper using the public JSON API — date-range based.
+
+Collects ALL publications within the date range by paginating
+through /timeline with sorting=date (newest → oldest).
+"""
 
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime as _parse_rfc2822
 
 import requests
 from bs4 import BeautifulSoup
@@ -13,17 +19,17 @@ from src.scrapers.base import BaseScraper, RawArticle
 logger = logging.getLogger(__name__)
 
 VC_API_BASE = "https://api.vc.ru/v2.8"
-MAX_PAGES = 100  # safety limit
+
+# 2000+ entries/day ÷ 50/page = 40+ pages/day; for 30-day range need ~1200
+MAX_PAGES = 1500
+ITEMS_PER_PAGE = 50  # max the API typically allows
 
 
 class VcScraper(BaseScraper):
-    """Fetches all VC.ru articles within a given date range.
+    """Fetches ALL VC.ru entries within a date range.
 
-    The VC.ru /timeline API returns items wrapped in a ``data`` envelope::
-
-        { "id": ..., "type": ..., "data": { <actual article fields> } }
-
-    All article fields (title, date, blocks, etc.) live inside ``data``.
+    VC.ru /timeline items are wrapped: ``{"data": {article fields}, ...}``.
+    Pagination uses ``lastId`` + ``lastSortingValue`` cursors.
     """
 
     def __init__(self, timeout: int = 30) -> None:
@@ -48,12 +54,18 @@ class VcScraper(BaseScraper):
         until_aware = self._ensure_tz(until) if until else datetime.now(timezone.utc)
 
         articles: list[RawArticle] = []
+        seen_ids: set[int | str] = set()
         last_sorting_value: str | int | None = None
         last_id: int | None = None
-        reached_boundary = False
+
+        consecutive_old_pages = 0  # require 3 consecutive all-old pages to stop
+        stall_count = 0  # detect cursor not advancing
 
         for page_num in range(MAX_PAGES):
-            params: dict = {"count": 20, "allSite": "true", "sorting": "date"}
+            params: dict = {
+                "count": ITEMS_PER_PAGE,
+                "sorting": "date",
+            }
             if last_sorting_value is not None:
                 params["lastSortingValue"] = last_sorting_value
             if last_id is not None:
@@ -68,8 +80,20 @@ class VcScraper(BaseScraper):
                 resp.raise_for_status()
                 data = resp.json()
             except requests.RequestException as exc:
-                logger.error("VC.ru API request failed: %s", exc)
-                break
+                logger.error("VC.ru API page %d failed: %s", page_num, exc)
+                # Brief pause and retry once
+                time.sleep(1)
+                try:
+                    resp = self.session.get(
+                        f"{VC_API_BASE}/timeline",
+                        params=params,
+                        timeout=self.timeout,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                except requests.RequestException:
+                    logger.error("VC.ru API page %d retry failed, stopping", page_num)
+                    break
 
             result = data.get("result", {})
             if not isinstance(result, dict):
@@ -80,86 +104,118 @@ class VcScraper(BaseScraper):
             new_last_id = result.get("lastId")
             new_last_sorting = result.get("lastSortingValue")
 
+            # Log first page structure
             if page_num == 0:
                 logger.info(
-                    "VC.ru page 0: %d raw items, lastId=%s, lastSortingValue=%s",
+                    "VC.ru page 0: %d items, lastId=%s, lastSortingValue=%s",
                     len(raw_items), new_last_id, new_last_sorting,
                 )
                 if raw_items and isinstance(raw_items[0], dict):
                     first_raw = raw_items[0]
-                    logger.info(
-                        "VC.ru first raw item keys: %s", sorted(first_raw.keys()),
-                    )
-                    # Unwrap and log the actual article data
+                    logger.info("VC.ru first raw item keys: %s", sorted(first_raw.keys()))
                     first_data = first_raw.get("data", first_raw)
                     if isinstance(first_data, dict):
-                        logger.info(
-                            "VC.ru first item data keys: %s", sorted(first_data.keys()),
-                        )
-                        for k in ("date", "dateRFC", "title", "url"):
+                        for k in ("date", "dateRFC", "title"):
                             if k in first_data:
-                                val = first_data[k]
-                                logger.info("VC.ru first item data.%s = %r", k, str(val)[:120])
+                                logger.info("VC.ru item[0].data.%s = %r", k, str(first_data[k])[:120])
 
             if not raw_items:
-                logger.info("VC.ru: no items on page %d", page_num)
+                logger.info("VC.ru: empty page %d, stopping", page_num)
                 break
 
-            # Unwrap items: each item has {"data": {actual article}, ...}
-            page_too_old_count = 0
-            page_total = 0
+            # Process items
+            page_in_range = 0
+            page_too_old = 0
+            page_too_new = 0
 
             for raw_item in raw_items:
                 if not isinstance(raw_item, dict):
                     continue
 
-                # Unwrap the data envelope
                 entry = raw_item.get("data", raw_item)
                 if not isinstance(entry, dict):
                     continue
 
-                page_total += 1
+                # Deduplicate
+                eid = entry.get("id")
+                if eid is not None and eid in seen_ids:
+                    continue
+                if eid is not None:
+                    seen_ids.add(eid)
+
                 pub_dt = self._extract_date(entry)
 
                 if pub_dt is not None:
                     pub_aware = self._ensure_tz(pub_dt)
                     if pub_aware > until_aware:
-                        continue  # too new, keep going
+                        page_too_new += 1
+                        continue
                     if pub_aware < since_aware:
-                        page_too_old_count += 1
-                        continue  # too old, skip but count
+                        page_too_old += 1
+                        continue
 
+                page_in_range += 1
                 article = self._parse_entry(entry)
                 if article is not None:
                     articles.append(article)
 
-            # Stop when entire page is older than range
-            if page_total > 0 and page_too_old_count == page_total:
-                reached_boundary = True
+            # Track consecutive all-old pages to confirm we've left the range
+            if page_too_old > 0 and page_in_range == 0 and page_too_new == 0:
+                consecutive_old_pages += 1
+            else:
+                consecutive_old_pages = 0
 
-            if reached_boundary:
+            if consecutive_old_pages >= 3:
+                logger.info("VC.ru: 3 consecutive all-old pages, stopping at page %d", page_num)
                 break
 
-            # Pagination via lastSortingValue + lastId
+            # Progress logging every 10 pages
+            if (page_num + 1) % 10 == 0:
+                logger.info(
+                    "VC.ru page %d: collected %d articles so far "
+                    "(this page: %d in range, %d old, %d new)",
+                    page_num, len(articles), page_in_range, page_too_old, page_too_new,
+                )
+
+            # Advance pagination cursor
+            cursor_advanced = False
             if new_last_sorting is not None and new_last_sorting != last_sorting_value:
                 last_sorting_value = new_last_sorting
                 last_id = new_last_id
+                cursor_advanced = True
             elif new_last_id is not None and new_last_id != last_id:
                 last_id = new_last_id
+                cursor_advanced = True
+
+            if not cursor_advanced:
+                stall_count += 1
+                if stall_count >= 3:
+                    logger.warning(
+                        "VC.ru: cursor stalled for 3 pages at lastId=%s, stopping", last_id,
+                    )
+                    break
+                # Try to unstall by using just lastId from last item
+                if raw_items:
+                    fallback_entry = raw_items[-1]
+                    if isinstance(fallback_entry, dict):
+                        fb_data = fallback_entry.get("data", fallback_entry)
+                        if isinstance(fb_data, dict) and fb_data.get("id"):
+                            last_id = fb_data["id"]
+                            last_sorting_value = new_last_sorting
             else:
-                break
+                stall_count = 0
 
         logger.info(
-            "VC.ru: fetched %d articles in range %s – %s (pages: %d)",
-            len(articles), since_aware.date(), until_aware.date(), page_num + 1,
+            "VC.ru TOTAL: %d articles in range %s – %s (pages: %d, seen IDs: %d)",
+            len(articles), since_aware.date(), until_aware.date(),
+            page_num + 1, len(seen_ids),
         )
         return articles
 
     # ------------------------------------------------------------------
 
     def _extract_date(self, entry: dict) -> datetime | None:
-        """Try multiple date fields; handle seconds and milliseconds."""
-        for field in ("date", "dateRFC", "date_rfc", "last_modification_date"):
+        for field in ("date", "dateRFC", "last_modification_date"):
             val = entry.get(field)
             if val is not None:
                 parsed = self._parse_date(val)
@@ -227,7 +283,6 @@ class VcScraper(BaseScraper):
                         self._html_to_text(text_val) if "<" in text_val else text_val
                     )
 
-        # Fallback: entryContent HTML
         if not parts:
             entry_content = entry.get("entryContent", {})
             if isinstance(entry_content, dict):
@@ -237,8 +292,6 @@ class VcScraper(BaseScraper):
 
         return "\n".join(p for p in parts if p)
 
-    # ------------------------------------------------------------------
-    # Helpers
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -259,22 +312,21 @@ class VcScraper(BaseScraper):
         if value is None:
             return None
         if isinstance(value, (int, float)):
-            # Handle both seconds and milliseconds timestamps
             if value > 1e12:
                 value = value / 1000.0
-            return datetime.fromtimestamp(value, tz=timezone.utc)
+            try:
+                return datetime.fromtimestamp(value, tz=timezone.utc)
+            except (OSError, ValueError):
+                return None
         if isinstance(value, str):
             try:
                 return datetime.fromisoformat(value)
             except ValueError:
                 pass
-            # Try RFC 2822 via email.utils
             try:
-                from email.utils import parsedate_to_datetime
-                return parsedate_to_datetime(value)
+                return _parse_rfc2822(value)
             except Exception:
                 pass
-            # Try as numeric string
             try:
                 ts = float(value)
                 if ts > 1e12:

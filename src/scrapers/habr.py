@@ -1,9 +1,14 @@
-"""Habr.com scraper: RSS pagination by date range + kek/v2 API for full content."""
+"""Habr.com scraper: RSS pagination by date range + kek/v2 API for full content.
+
+Collects ALL publications within the date range by paginating
+through RSS pages until 3 consecutive pages are entirely older than ``since``.
+"""
 
 from __future__ import annotations
 
 import logging
 import re
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -19,14 +24,16 @@ logger = logging.getLogger(__name__)
 HABR_RSS = "https://habr.com/ru/rss/all/all/"
 HABR_API_BASE = "https://habr.com/kek/v2"
 
-MAX_PAGES = 200  # safety limit
+# Habr RSS: ~40 items/page. For a full day with ~500-1000 articles,
+# need ~25-50 pages. Allow up to 500 pages for multi-day ranges.
+MAX_PAGES = 500
 
 
 class HabrScraper(BaseScraper):
-    """Fetches articles from Habr via RSS (for list) + kek/v2 API (for full body).
+    """Fetches ALL articles from Habr within a date range.
 
-    Paginates RSS pages backwards until the majority of articles on a page
-    are older than ``since``, then stops.
+    Uses RSS for article listing (with pagination) and kek/v2 API
+    for full article body enrichment.
     """
 
     def __init__(self, timeout: int = 30) -> None:
@@ -54,7 +61,7 @@ class HabrScraper(BaseScraper):
 
         all_stubs: list[dict] = []
         seen_links: set[str] = set()
-        stop_paging = False
+        consecutive_old_pages = 0
 
         for page in range(1, MAX_PAGES + 1):
             stubs = self._fetch_rss_page(page)
@@ -63,6 +70,7 @@ class HabrScraper(BaseScraper):
 
             in_range = 0
             too_old = 0
+            too_new = 0
 
             for stub in stubs:
                 link = stub["link"]
@@ -79,34 +87,41 @@ class HabrScraper(BaseScraper):
                 pub_aware = self._ensure_tz(pub)
 
                 if pub_aware > until_aware:
-                    continue  # too new, skip
+                    too_new += 1
+                    continue
                 if pub_aware < since_aware:
                     too_old += 1
-                    continue  # too old, skip but count
+                    continue
 
                 all_stubs.append(stub)
                 in_range += 1
 
-            # Stop when the entire page is older than our range
-            total_on_page = in_range + too_old
-            if total_on_page > 0 and too_old == total_on_page:
-                stop_paging = True
+            # Track consecutive all-old pages (require 3 to confirm boundary)
+            if too_old > 0 and in_range == 0 and too_new == 0:
+                consecutive_old_pages += 1
+            else:
+                consecutive_old_pages = 0
 
+            if consecutive_old_pages >= 3:
+                logger.info(
+                    "Habr: 3 consecutive all-old pages, stopping at page %d", page,
+                )
+                break
+
+            # Progress logging every 10 pages
             if page % 10 == 0:
                 logger.info(
-                    "Habr RSS page %d: %d in range, %d too old, total collected: %d",
-                    page, in_range, too_old, len(all_stubs),
+                    "Habr RSS page %d: collected %d stubs so far "
+                    "(this page: %d in range, %d old, %d new)",
+                    page, len(all_stubs), in_range, too_old, too_new,
                 )
-
-            if stop_paging:
-                break
 
         logger.info(
             "Habr: collected %d stubs in range %s – %s (pages scanned: %d)",
             len(all_stubs), since_aware.date(), until_aware.date(), page,
         )
 
-        # Enrich each stub with full body
+        # Enrich stubs with full body via API
         articles: list[RawArticle] = []
         for i, stub in enumerate(all_stubs):
             article = self._enrich_with_api(stub)
@@ -115,7 +130,7 @@ class HabrScraper(BaseScraper):
             if (i + 1) % 100 == 0:
                 logger.info("Habr: enriched %d / %d articles", i + 1, len(all_stubs))
 
-        logger.info("Habr: fetched %d articles total", len(articles))
+        logger.info("Habr TOTAL: %d articles fetched", len(articles))
         return articles
 
     # ------------------------------------------------------------------
@@ -123,14 +138,20 @@ class HabrScraper(BaseScraper):
     def _fetch_rss_page(self, page: int) -> list[dict]:
         """Fetch one page of Habr RSS."""
         url = HABR_RSS if page == 1 else f"{HABR_RSS}page{page}/"
-        try:
-            resp = self.session.get(url, timeout=self.timeout)
-            if resp.status_code == 404:
+
+        for attempt in range(2):
+            try:
+                resp = self.session.get(url, timeout=self.timeout)
+                if resp.status_code == 404:
+                    return []
+                resp.raise_for_status()
+                break
+            except requests.RequestException as exc:
+                if attempt == 0:
+                    time.sleep(1)
+                    continue
+                logger.error("Habr RSS page %d failed: %s", page, exc)
                 return []
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            logger.error("Habr RSS page %d failed: %s", page, exc)
-            return []
 
         try:
             root = ET.fromstring(resp.content)
@@ -205,8 +226,6 @@ class HabrScraper(BaseScraper):
         )
 
     # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _ensure_tz(dt: datetime) -> datetime:
@@ -216,7 +235,7 @@ class HabrScraper(BaseScraper):
 
     @staticmethod
     def _normalize_link(link: str) -> str:
-        """Strip UTM and tracking query params, keep canonical URL."""
+        """Strip UTM and tracking query params."""
         parsed = urlparse(link)
         kept = {
             k: v for k, v in parse_qs(parsed.query).items()
