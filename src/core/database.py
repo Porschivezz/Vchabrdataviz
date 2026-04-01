@@ -22,9 +22,17 @@ def get_session() -> Session:
 
 
 def init_db() -> None:
-    """Create pgvector extension and all tables."""
+    """Create pgvector extension and all tables, apply migrations."""
     with engine.begin() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
 
     from src.core.models import Base  # noqa: F811
     Base.metadata.create_all(bind=engine)
+
+    # Migrate embedding column from 1536 to 4096 if needed
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE articles "
+            "ALTER COLUMN embedding TYPE vector(4096) "
+            "USING NULL"
+        ))

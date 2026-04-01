@@ -55,14 +55,14 @@ def analyze_articles(
                 if result.embedding and any(v != 0.0 for v in result.embedding):
                     article.embedding = result.embedding
                 article.status = "ANALYZED"
+                session.commit()
                 analyzed += 1
                 logger.info("Analyzed: %s", article.title[:60])
             except Exception as exc:
+                session.rollback()
                 logger.error(
                     "Failed to analyze article %s: %s", article.id, exc
                 )
-
-        session.commit()
     except Exception:
         session.rollback()
         raise

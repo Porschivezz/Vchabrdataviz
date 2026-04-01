@@ -89,4 +89,4 @@ class OpenRouterProvider(BaseLLMProvider):
             return response.data[0]["embedding"]
         except Exception as exc:
             logger.error("Embedding request failed: %s", exc)
-            return [0.0] * 1536
+            return [0.0] * 4096

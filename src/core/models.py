@@ -44,7 +44,7 @@ class Article(Base):
 
     summary = Column(Text, nullable=True)
     entities = Column(JSONB, nullable=True)
-    embedding = Column(Vector(1536), nullable=True)
+    embedding = Column(Vector(4096), nullable=True)
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(
