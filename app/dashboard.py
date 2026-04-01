@@ -456,31 +456,84 @@ elif page == "Admin Panel":
             st.rerun()
 
     with col_b:
-        st.markdown("**Analyze Articles**")
+        st.markdown("**Analyze Articles by Date Range**")
+
+        analyze_preset = st.selectbox(
+            "Quick period",
+            [
+                "Yesterday + today",
+                "Last 3 days",
+                "Last 7 days",
+                "Last 30 days",
+                "Custom range",
+            ],
+            key="analyze_preset",
+        )
+
+        if analyze_preset == "Custom range":
+            ad1, ad2 = st.columns(2)
+            with ad1:
+                a_since = st.date_input("From", value=today - timedelta(days=1), key="a_since")
+            with ad2:
+                a_until = st.date_input("To", value=today, key="a_until")
+        else:
+            a_days_map = {
+                "Yesterday + today": 1,
+                "Last 3 days": 3,
+                "Last 7 days": 7,
+                "Last 30 days": 30,
+            }
+            a_since = today - timedelta(days=a_days_map[analyze_preset])
+            a_until = today
+
+        st.caption(f"Period: **{a_since}** — **{a_until}** (UTC)")
+
         analyze_scope = st.selectbox(
             "Scope",
-            ["QUEUED_FOR_ANALYSIS only", "PENDING only", "Both"],
+            ["QUEUED + PENDING", "QUEUED_FOR_ANALYSIS only", "PENDING only"],
         )
-        analyze_batch = st.number_input("Batch size", min_value=1, max_value=50, value=10)
+
+        # Show how many articles will be analyzed
+        scope_map = {
+            "QUEUED + PENDING": ["QUEUED_FOR_ANALYSIS", "PENDING"],
+            "QUEUED_FOR_ANALYSIS only": ["QUEUED_FOR_ANALYSIS"],
+            "PENDING only": ["PENDING"],
+        }
+        a_since_dt = datetime.combine(a_since, datetime.min.time(), tzinfo=timezone.utc)
+        a_until_dt = datetime.combine(a_until, datetime.max.time(), tzinfo=timezone.utc)
+
+        a_session = get_session()
+        try:
+            from sqlalchemy import or_, and_
+            a_status_conds = [Article.status == s for s in scope_map[analyze_scope]]
+            pending_count = a_session.execute(
+                select(func.count(Article.id)).where(
+                    and_(
+                        or_(*a_status_conds),
+                        Article.published_at >= a_since_dt,
+                        Article.published_at <= a_until_dt,
+                    )
+                )
+            ).scalar()
+        finally:
+            a_session.close()
+
+        st.info(f"Articles to analyze: **{pending_count}**")
 
         if st.button("Run Analysis", type="primary"):
-            with st.spinner("Running LLM analysis..."):
+            with st.spinner(f"Analyzing {pending_count} articles from {a_since} to {a_until}..."):
                 from src.nlp.openrouter import OpenRouterProvider
-                from src.services.analysis_service import (
-                    analyze_all_unprocessed,
-                    analyze_pending,
-                    analyze_queued,
-                )
+                from src.services.analysis_service import analyze_by_date_range
 
                 provider = OpenRouterProvider()
-                if analyze_scope == "QUEUED_FOR_ANALYSIS only":
-                    n = analyze_queued(provider, batch_size=analyze_batch)
-                elif analyze_scope == "PENDING only":
-                    n = analyze_pending(provider, batch_size=analyze_batch)
-                else:
-                    n = analyze_all_unprocessed(provider, batch_size=analyze_batch)
+                n = analyze_by_date_range(
+                    provider,
+                    since=a_since_dt,
+                    until=a_until_dt,
+                    statuses=scope_map[analyze_scope],
+                )
 
-            st.success(f"Analyzed {n} articles.")
+            st.success(f"Analyzed {n} / {pending_count} articles.")
             st.rerun()
 
     # --- Recent articles table ---
