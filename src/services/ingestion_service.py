@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from src.core.config import settings
@@ -73,34 +74,35 @@ def _ingest_one(
     keywords: list[str],
     stats: dict,
 ) -> None:
-    existing = session.execute(
-        select(Article.id).where(Article.link == raw.link)
-    ).scalar_one_or_none()
-
-    if existing is not None:
-        stats["skipped"] += 1
-        return
-
     tokens = estimate_tokens(raw.raw_text)
-
-    if should_auto_analyze(raw.native_tags, keywords):
-        status = "QUEUED_FOR_ANALYSIS"
-        stats["queued"] += 1
-    else:
-        status = "PENDING"
-
-    article = Article(
-        source=raw.source,
-        title=raw.title,
-        link=raw.link,
-        published_at=raw.published_at,
-        raw_text=raw.raw_text,
-        native_tags=raw.native_tags,
-        estimated_tokens=tokens,
-        status=status,
+    status = (
+        "QUEUED_FOR_ANALYSIS"
+        if should_auto_analyze(raw.native_tags, keywords)
+        else "PENDING"
     )
-    session.add(article)
-    stats["new"] += 1
+
+    stmt = (
+        pg_insert(Article)
+        .values(
+            source=raw.source,
+            title=raw.title,
+            link=raw.link,
+            published_at=raw.published_at,
+            raw_text=raw.raw_text,
+            native_tags=raw.native_tags,
+            estimated_tokens=tokens,
+            status=status,
+        )
+        .on_conflict_do_nothing(index_elements=["link"])
+    )
+    result = session.execute(stmt)
+
+    if result.rowcount == 0:
+        stats["skipped"] += 1
+    else:
+        stats["new"] += 1
+        if status == "QUEUED_FOR_ANALYSIS":
+            stats["queued"] += 1
 
 
 def ingest_all(

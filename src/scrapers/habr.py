@@ -7,6 +7,7 @@ import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -117,7 +118,7 @@ class HabrScraper(BaseScraper):
 
         items: list[dict] = []
         for item_el in root.findall(".//item"):
-            link = (item_el.findtext("link") or "").strip()
+            link = self._normalize_link((item_el.findtext("link") or "").strip())
             title = (item_el.findtext("title") or "").strip()
             pub_str = (item_el.findtext("pubDate") or "").strip()
             description = (item_el.findtext("description") or "").strip()
@@ -190,6 +191,18 @@ class HabrScraper(BaseScraper):
         if dt.tzinfo is None:
             return dt.replace(tzinfo=timezone.utc)
         return dt
+
+    @staticmethod
+    def _normalize_link(link: str) -> str:
+        """Strip UTM and tracking query params, keep canonical URL."""
+        parsed = urlparse(link)
+        # Keep only non-tracking params (drop utm_*, campaign etc.)
+        kept = {
+            k: v for k, v in parse_qs(parsed.query).items()
+            if not k.startswith("utm_") and k not in ("campaign",)
+        }
+        clean_query = urlencode(kept, doseq=True)
+        return urlunparse(parsed._replace(query=clean_query))
 
     @staticmethod
     def _extract_id(link: str) -> str | None:

@@ -45,34 +45,54 @@ class VcScraper(BaseScraper):
         reached_boundary = False
 
         for page_num in range(MAX_PAGES):
-            params: dict = {"count": 20, "allSite": 1}
+            params: dict = {"count": 20}
             if last_id is not None:
                 params["last_id"] = last_id
 
+            # Try /timeline first, fall back to /feed if it fails
+            endpoint = f"{VC_API_BASE}/timeline"
+
             try:
-                resp = self.session.get(
-                    f"{VC_API_BASE}/feed",
-                    params=params,
-                    timeout=self.timeout,
-                )
+                resp = self.session.get(endpoint, params=params, timeout=self.timeout)
+                if resp.status_code == 404:
+                    resp = self.session.get(
+                        f"{VC_API_BASE}/feed", params=params, timeout=self.timeout
+                    )
                 resp.raise_for_status()
                 data = resp.json()
             except requests.RequestException as exc:
                 logger.error("VC.ru API request failed: %s", exc)
                 break
 
+            # Log raw structure on first page to help diagnose format issues
+            if page_num == 0:
+                result_type = type(data.get("result")).__name__
+                result_keys = (
+                    list(data.get("result", {}).keys())
+                    if isinstance(data.get("result"), dict)
+                    else "—"
+                )
+                logger.info(
+                    "VC.ru API response keys: %s, result type: %s, result keys: %s",
+                    list(data.keys()),
+                    result_type,
+                    result_keys,
+                )
+
             result = data.get("result", {})
             if isinstance(result, list):
                 items = result
                 next_last_id = None
             elif isinstance(result, dict):
-                items = result.get("items", [])
-                next_last_id = result.get("last_id")
+                # Handle both "items" and "data" sub-keys
+                items = result.get("items", result.get("data", []))
+                next_last_id = result.get("last_id", result.get("lastId"))
             else:
-                logger.warning("VC.ru: unexpected result type: %s", type(result))
+                logger.warning("VC.ru: unexpected result type: %s, data=%r", type(result), str(data)[:300])
                 break
 
             if not items:
+                logger.info("VC.ru: empty items on page %d (result keys: %s)", page_num, list(result.keys()) if isinstance(result, dict) else type(result))
                 break
 
             for item in items:
