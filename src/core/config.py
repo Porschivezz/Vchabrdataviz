@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     llm_model: str = "openai/gpt-4o-mini"
     embedding_model: str = "openai/text-embedding-3-small"
+    embedding_dimensions: int = 1536
 
     # Cost per 1 M tokens (USD)
     llm_input_cost_per_1m: float = 0.15
@@ -22,6 +23,13 @@ class Settings(BaseSettings):
 
     # --- Auto-trigger ---
     auto_analyze_keywords: str = "python,ml,ai,data science,llm,gpt"
+
+    # --- Redis / Celery ---
+    redis_url: str = "redis://redis:6379/0"
+
+    # --- Telegram ---
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
 
     # --- Admin ---
     admin_password: str = "changeme123"

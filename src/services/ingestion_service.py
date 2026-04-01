@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from src.core.config import settings
 from src.core.database import get_session
-from src.core.models import Article
+from src.core.models import Article, IngestionRun
 from src.scrapers.base import BaseScraper, RawArticle
 
 logger = logging.getLogger(__name__)
@@ -37,23 +37,53 @@ def ingest_from_scraper(
     *,
     since: datetime,
     until: datetime | None = None,
+    source_name: str = "",
 ) -> dict:
     """Run a scraper for a date range and persist new articles.
 
     Returns {"new": int, "skipped": int, "queued": int, "total_fetched": int}.
     """
-    raw_articles = scraper.fetch_articles(since=since, until=until)
-    keywords = settings.keywords_list
-
-    stats = {"new": 0, "skipped": 0, "queued": 0, "total_fetched": len(raw_articles)}
     session: Session = get_session()
 
+    # Create ingestion run record
+    run = IngestionRun(
+        source=source_name or type(scraper).__name__,
+        since=since,
+        until=until or datetime.now(timezone.utc),
+        status="RUNNING",
+    )
+    session.add(run)
+    session.commit()
+
     try:
+        raw_articles = scraper.fetch_articles(since=since, until=until)
+        keywords = settings.keywords_list
+
+        stats = {"new": 0, "skipped": 0, "queued": 0, "total_fetched": len(raw_articles)}
+
         for raw in raw_articles:
             _ingest_one(session, raw, keywords, stats)
         session.commit()
-    except Exception:
+
+        # Update run record
+        run.total_fetched = stats["total_fetched"]
+        run.new_articles = stats["new"]
+        run.skipped = stats["skipped"]
+        run.queued = stats["queued"]
+        run.status = "SUCCESS"
+        run.finished_at = datetime.now(timezone.utc)
+        session.commit()
+
+    except Exception as exc:
         session.rollback()
+        # Try to mark run as failed
+        try:
+            run.status = "FAILED"
+            run.error_message = str(exc)[:500]
+            run.finished_at = datetime.now(timezone.utc)
+            session.commit()
+        except Exception:
+            session.rollback()
         raise
     finally:
         session.close()
@@ -109,20 +139,25 @@ def ingest_all(
     *,
     since: datetime,
     until: datetime | None = None,
+    sources: list[str] | None = None,
 ) -> dict:
-    """Run all registered scrapers for a date range."""
-    from src.scrapers.habr import HabrScraper
-    from src.scrapers.vc import VcScraper
+    """Run all registered (or specified) scrapers for a date range."""
+    from src.scrapers.registry import get_enabled_sources
 
     total_stats = {"new": 0, "skipped": 0, "queued": 0, "total_fetched": 0}
 
-    for scraper in [HabrScraper(), VcScraper()]:
+    enabled = get_enabled_sources()
+    if sources:
+        enabled = {k: v for k, v in enabled.items() if k in sources}
+
+    for name, config in enabled.items():
         try:
-            s = ingest_from_scraper(scraper, since=since, until=until)
+            scraper = config.scraper_class()
+            s = ingest_from_scraper(scraper, since=since, until=until, source_name=name)
             for k in total_stats:
                 total_stats[k] += s[k]
         except Exception as exc:
-            logger.error("Scraper %s failed: %s", type(scraper).__name__, exc)
+            logger.error("Scraper %s failed: %s", name, exc)
 
     return total_stats
 

@@ -11,6 +11,7 @@ class AnalysisResult:
     """Output of the LLM analysis pipeline for a single article."""
     summary: str = ""
     entities: dict = field(default_factory=dict)
+    sentiment: float | None = None
     embedding: list[float] = field(default_factory=list)
 
 

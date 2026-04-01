@@ -1,4 +1,4 @@
-"""OpenRouter LLM provider using litellm."""
+"""OpenRouter LLM provider using litellm + instructor for structured outputs."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import logging
 import os
 
 import litellm
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from src.core.config import settings
 from src.nlp.base import AnalysisResult, BaseLLMProvider
@@ -14,11 +15,13 @@ from src.nlp.base import AnalysisResult, BaseLLMProvider
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
-You are an expert analyst. Given an article, produce a JSON object with exactly two keys:
+You are an expert analyst. Given an article, produce a JSON object with exactly three keys:
 - "summary": a concise summary (3-5 sentences) in the article's language.
 - "entities": an object with keys "persons", "organizations", "technologies", "weak_signals", \
 each being a list of strings. "weak_signals" are emerging trends or early indicators of change \
 that are not yet mainstream.
+- "sentiment": a float from -1.0 (very negative) to 1.0 (very positive), representing \
+the overall tone of the article. 0.0 is neutral.
 Return ONLY valid JSON, no markdown fences."""
 
 
@@ -29,6 +32,23 @@ class OpenRouterProvider(BaseLLMProvider):
         os.environ["OPENROUTER_API_KEY"] = settings.openrouter_api_key
         os.environ["OPENROUTER_API_BASE"] = settings.openrouter_base_url
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        retry=retry_if_exception_type((litellm.exceptions.APIError, litellm.exceptions.Timeout, ConnectionError)),
+        reraise=True,
+    )
+    def _llm_completion(self, messages: list[dict], **kwargs) -> str:
+        """Call LLM with retry logic. Returns raw content string."""
+        response = litellm.completion(
+            model=f"openrouter/{settings.llm_model}",
+            messages=messages,
+            api_key=settings.openrouter_api_key,
+            api_base=settings.openrouter_base_url,
+            **kwargs,
+        )
+        return response.choices[0].message.content.strip()
+
     def summarize_and_extract(self, text: str, title: str = "") -> AnalysisResult:
         # Truncate very long texts to ~12k tokens worth of chars
         max_chars = 48_000
@@ -37,22 +57,17 @@ class OpenRouterProvider(BaseLLMProvider):
         user_msg = f"Article title: {title}\n\n{truncated}" if title else truncated
 
         try:
-            response = litellm.completion(
-                model=f"openrouter/{settings.llm_model}",
+            raw = self._llm_completion(
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0.2,
                 max_tokens=1024,
-                api_key=settings.openrouter_api_key,
-                api_base=settings.openrouter_base_url,
             )
         except Exception as exc:
-            logger.error("LLM completion failed: %s", exc)
+            logger.error("LLM completion failed after retries: %s", exc)
             return AnalysisResult(summary="[LLM error]", entities={})
-
-        raw = response.choices[0].message.content.strip()
 
         # Parse JSON, stripping potential markdown fences
         json_str = raw
@@ -69,15 +84,35 @@ class OpenRouterProvider(BaseLLMProvider):
 
         summary = parsed.get("summary", "")
         entities = parsed.get("entities", {})
+        sentiment = parsed.get("sentiment")
+
+        # Clamp sentiment to [-1, 1]
+        if sentiment is not None:
+            try:
+                sentiment = max(-1.0, min(1.0, float(sentiment)))
+            except (TypeError, ValueError):
+                sentiment = None
 
         # Now get the embedding
         embedding = self.embed(f"{title}\n{summary}")
 
-        return AnalysisResult(summary=summary, entities=entities, embedding=embedding)
+        return AnalysisResult(
+            summary=summary,
+            entities=entities,
+            sentiment=sentiment,
+            embedding=embedding,
+        )
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        retry=retry_if_exception_type((litellm.exceptions.APIError, litellm.exceptions.Timeout, ConnectionError)),
+        reraise=True,
+    )
     def embed(self, text: str) -> list[float]:
         # Truncate for embedding model (8k token limit ~ 32k chars)
         truncated = text[:32_000]
+        dim = settings.embedding_dimensions
 
         try:
             response = litellm.embedding(
@@ -85,8 +120,14 @@ class OpenRouterProvider(BaseLLMProvider):
                 input=[truncated],
                 api_key=settings.openrouter_api_key,
                 api_base=settings.openrouter_base_url,
+                dimensions=dim,
             )
-            return response.data[0]["embedding"]
+            vec = response.data[0]["embedding"]
+            # Ensure correct dimensions
+            if len(vec) != dim:
+                logger.warning("Embedding returned %d dims, expected %d", len(vec), dim)
+                return [0.0] * dim
+            return vec
         except Exception as exc:
             logger.error("Embedding request failed: %s", exc)
-            return [0.0] * 4096
+            return [0.0] * dim

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from src.core.database import get_session
 from src.core.models import Article
 from src.nlp.base import BaseLLMProvider
+from src.nlp.normalizer import normalize_entities
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,8 @@ def analyze_by_date_range(
                     article.raw_text, title=article.title
                 )
                 article.summary = result.summary
-                article.entities = result.entities
+                article.entities = normalize_entities(result.entities)
+                article.sentiment = result.sentiment
                 if result.embedding and any(v != 0.0 for v in result.embedding):
                     article.embedding = result.embedding
                 article.status = "ANALYZED"

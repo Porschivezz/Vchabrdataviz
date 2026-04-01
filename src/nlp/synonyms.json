@@ -1,0 +1,50 @@
+{
+  "organizations": {
+    "Google": ["Google LLC", "Alphabet", "Гугл", "гугл"],
+    "Yandex": ["Яндекс", "яндекс", "Yandex LLC"],
+    "Microsoft": ["Microsoft Corp", "MS", "Майкрософт", "майкрософт"],
+    "Meta": ["Meta Platforms", "Facebook", "Мета", "Фейсбук"],
+    "Apple": ["Apple Inc", "Эпл", "эпл"],
+    "Amazon": ["Amazon.com", "AWS", "Амазон"],
+    "OpenAI": ["Open AI", "ОпенАИ"],
+    "Anthropic": ["Антропик"],
+    "VK": ["ВКонтакте", "VKontakte", "ВК", "Mail.ru Group"],
+    "Sber": ["Сбербанк", "Сбер", "SberBank", "SberDevices"],
+    "Tinkoff": ["Тинькофф", "T-Bank", "Т-Банк"],
+    "Huawei": ["Хуавей"],
+    "Samsung": ["Самсунг"],
+    "Nvidia": ["NVIDIA", "Нвидиа"],
+    "Tesla": ["Тесла"],
+    "Telegram": ["Телеграм", "Телеграмм"]
+  },
+  "technologies": {
+    "GPT-4": ["GPT4", "gpt-4", "гпт-4", "ГПТ-4"],
+    "GPT-4o": ["GPT4o", "gpt-4o"],
+    "ChatGPT": ["Chat GPT", "ЧатГПТ", "чатгпт"],
+    "LLM": ["Large Language Model", "большая языковая модель", "БЯМ"],
+    "Machine Learning": ["ML", "машинное обучение", "МО"],
+    "Deep Learning": ["DL", "глубокое обучение"],
+    "Neural Network": ["нейросеть", "нейронная сеть", "нейросети"],
+    "Artificial Intelligence": ["AI", "ИИ", "искусственный интеллект"],
+    "Natural Language Processing": ["NLP", "обработка естественного языка"],
+    "Computer Vision": ["CV", "компьютерное зрение"],
+    "Kubernetes": ["K8s", "k8s", "кубернетис"],
+    "Docker": ["докер"],
+    "Python": ["питон", "пайтон"],
+    "Rust": ["раст"],
+    "TypeScript": ["TS", "тайпскрипт"],
+    "PostgreSQL": ["Postgres", "постгрес", "PostgreSQL"],
+    "React": ["ReactJS", "React.js", "реакт"],
+    "Vue": ["Vue.js", "VueJS"],
+    "RAG": ["Retrieval-Augmented Generation"]
+  },
+  "persons": {
+    "Elon Musk": ["Илон Маск", "Маск"],
+    "Sam Altman": ["Сэм Альтман", "Альтман"],
+    "Jensen Huang": ["Дженсен Хуанг"],
+    "Satya Nadella": ["Сатья Наделла"],
+    "Mark Zuckerberg": ["Марк Цукерберг", "Цукерберг"],
+    "Pavel Durov": ["Павел Дуров", "Дуров"],
+    "German Gref": ["Герман Греф", "Греф"]
+  }
+}
