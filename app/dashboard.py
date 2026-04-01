@@ -167,13 +167,38 @@ def _get_articles_per_day() -> pd.DataFrame:
                 FROM articles
                 WHERE published_at IS NOT NULL
                 GROUP BY source, DATE(published_at)
-                ORDER BY day
+                ORDER BY day DESC
                 """
             )
         ).fetchall()
         if not rows:
             return pd.DataFrame(columns=["source", "day", "cnt"])
         return pd.DataFrame(rows, columns=["source", "day", "cnt"])
+    finally:
+        session.close()
+
+
+def _get_articles_per_day_status() -> pd.DataFrame:
+    """Articles per day per source per status."""
+    session = get_session()
+    try:
+        rows = session.execute(
+            text(
+                """
+                SELECT source,
+                       DATE(published_at) AS day,
+                       status,
+                       COUNT(*) AS cnt
+                FROM articles
+                WHERE published_at IS NOT NULL
+                GROUP BY source, DATE(published_at), status
+                ORDER BY day DESC, source
+                """
+            )
+        ).fetchall()
+        if not rows:
+            return pd.DataFrame(columns=["source", "day", "status", "cnt"])
+        return pd.DataFrame(rows, columns=["source", "day", "status", "cnt"])
     finally:
         session.close()
 
@@ -296,25 +321,68 @@ elif page == "Admin Panel":
     total_in_db = sum(counts.values())
     c4.metric("Total in DB", total_in_db)
 
-    # --- DB coverage info ---
-    st.subheader("Database Coverage")
+    # --- Detailed per-day per-source breakdown ---
+    st.subheader("Articles per Day (by Source)")
+
+    day_df = _get_articles_per_day()
+    if not day_df.empty:
+        # Pivot table: rows=day, columns=source, values=count
+        pivot = day_df.pivot_table(
+            index="day", columns="source", values="cnt",
+            fill_value=0, aggfunc="sum",
+        )
+        pivot = pivot.sort_index(ascending=False)
+        pivot["TOTAL"] = pivot.sum(axis=1)
+
+        # Show as a clear table
+        st.dataframe(
+            pivot.reset_index().rename(columns={"day": "Date"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Chart
+        chart_pivot = day_df.pivot_table(
+            index="day", columns="source", values="cnt",
+            fill_value=0, aggfunc="sum",
+        ).sort_index()
+        st.bar_chart(chart_pivot)
+
+        # Today / yesterday summary
+        from datetime import date as dt_date
+        today_d = dt_date.today()
+        yesterday_d = today_d - timedelta(days=1)
+
+        today_total = int(pivot.loc[today_d, "TOTAL"]) if today_d in pivot.index else 0
+        yesterday_total = int(pivot.loc[yesterday_d, "TOTAL"]) if yesterday_d in pivot.index else 0
+
+        summary_cols = st.columns(2)
+        with summary_cols[0]:
+            today_detail = ""
+            if today_d in pivot.index:
+                today_detail = " | ".join(
+                    f"{src}: {int(pivot.loc[today_d, src])}"
+                    for src in pivot.columns if src != "TOTAL" and int(pivot.loc[today_d, src]) > 0
+                )
+            st.metric(f"Today ({today_d}), partial", f"{today_total} articles", help=today_detail)
+        with summary_cols[1]:
+            yest_detail = ""
+            if yesterday_d in pivot.index:
+                yest_detail = " | ".join(
+                    f"{src}: {int(pivot.loc[yesterday_d, src])}"
+                    for src in pivot.columns if src != "TOTAL" and int(pivot.loc[yesterday_d, src]) > 0
+                )
+            st.metric(f"Yesterday ({yesterday_d}), full day", f"{yesterday_total} articles", help=yest_detail)
+    else:
+        st.info("No articles in database yet.")
+
+    # --- DB coverage ---
     from src.services.ingestion_service import get_db_date_coverage
     coverage = get_db_date_coverage()
-
     if coverage["total"] > 0:
-        cov1, cov2, cov3 = st.columns(3)
+        cov1, cov2 = st.columns(2)
         cov1.metric("Earliest article", str(coverage["min_date"].date()) if coverage["min_date"] else "—")
         cov2.metric("Latest article", str(coverage["max_date"].date()) if coverage["max_date"] else "—")
-        per_src = coverage.get("per_source", {})
-        cov3.metric("Sources", ", ".join(f"{s}: {n}" for s, n in per_src.items()) or "—")
-
-        # Per-day chart
-        day_df = _get_articles_per_day()
-        if not day_df.empty:
-            pivot = day_df.pivot_table(index="day", columns="source", values="cnt", fill_value=0)
-            st.bar_chart(pivot)
-    else:
-        st.info("Database is empty. Run ingestion to start collecting articles.")
 
     # --- Cost estimation ---
     st.subheader("Cost Estimation for Pending Articles")
@@ -341,7 +409,13 @@ elif page == "Admin Panel":
 
         preset = st.selectbox(
             "Quick period",
-            ["Last 24 hours", "Last 3 days", "Last 7 days", "Last 30 days", "Custom range"],
+            [
+                "Yesterday + today",
+                "Last 3 days",
+                "Last 7 days",
+                "Last 30 days",
+                "Custom range",
+            ],
             key="ingest_preset",
         )
 
@@ -355,7 +429,7 @@ elif page == "Admin Panel":
                 until_date = st.date_input("To", value=today, key="until")
         else:
             days_map = {
-                "Last 24 hours": 1,
+                "Yesterday + today": 1,
                 "Last 3 days": 3,
                 "Last 7 days": 7,
                 "Last 30 days": 30,
@@ -363,7 +437,8 @@ elif page == "Admin Panel":
             days = days_map[preset]
             since_date = today - timedelta(days=days)
             until_date = today
-            st.caption(f"Period: **{since_date}** — **{until_date}**")
+
+        st.caption(f"Period: **{since_date}** — **{until_date}** (UTC)")
 
         if st.button("Run Ingestion", type="primary"):
             since_dt = datetime.combine(since_date, datetime.min.time(), tzinfo=timezone.utc)
@@ -414,7 +489,7 @@ elif page == "Admin Panel":
     try:
         all_articles = (
             session.execute(
-                select(Article).order_by(Article.created_at.desc()).limit(100)
+                select(Article).order_by(Article.published_at.desc().nullslast()).limit(100)
             )
             .scalars()
             .all()

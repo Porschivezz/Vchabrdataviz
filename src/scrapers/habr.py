@@ -19,13 +19,14 @@ logger = logging.getLogger(__name__)
 HABR_RSS = "https://habr.com/ru/rss/all/all/"
 HABR_API_BASE = "https://habr.com/kek/v2"
 
-MAX_PAGES = 50  # safety limit to avoid infinite pagination
+MAX_PAGES = 200  # safety limit
 
 
 class HabrScraper(BaseScraper):
     """Fetches articles from Habr via RSS (for list) + kek/v2 API (for full body).
 
-    Paginates RSS pages backwards until all articles in the date range are collected.
+    Paginates RSS pages backwards until the majority of articles on a page
+    are older than ``since``, then stops.
     """
 
     def __init__(self, timeout: int = 30) -> None:
@@ -52,48 +53,69 @@ class HabrScraper(BaseScraper):
         until_aware = self._ensure_tz(until) if until else datetime.now(timezone.utc)
 
         all_stubs: list[dict] = []
-        reached_boundary = False
+        seen_links: set[str] = set()
+        stop_paging = False
 
         for page in range(1, MAX_PAGES + 1):
             stubs = self._fetch_rss_page(page)
             if not stubs:
                 break
 
+            in_range = 0
+            too_old = 0
+
             for stub in stubs:
+                link = stub["link"]
+                if link in seen_links:
+                    continue
+                seen_links.add(link)
+
                 pub = stub.get("published_at")
                 if pub is None:
-                    # No date — include it (we'll filter later if needed)
                     all_stubs.append(stub)
+                    in_range += 1
                     continue
 
                 pub_aware = self._ensure_tz(pub)
 
                 if pub_aware > until_aware:
-                    # Too new, skip but keep paginating
-                    continue
+                    continue  # too new, skip
                 if pub_aware < since_aware:
-                    # Older than range — we've gone past the boundary
-                    reached_boundary = True
-                    break
+                    too_old += 1
+                    continue  # too old, skip but count
 
                 all_stubs.append(stub)
+                in_range += 1
 
-            if reached_boundary:
+            # Stop when the entire page is older than our range
+            total_on_page = in_range + too_old
+            if total_on_page > 0 and too_old == total_on_page:
+                stop_paging = True
+
+            if page % 10 == 0:
+                logger.info(
+                    "Habr RSS page %d: %d in range, %d too old, total collected: %d",
+                    page, in_range, too_old, len(all_stubs),
+                )
+
+            if stop_paging:
                 break
 
         logger.info(
-            "Habr: collected %d stubs in range %s – %s (pages: %d)",
+            "Habr: collected %d stubs in range %s – %s (pages scanned: %d)",
             len(all_stubs), since_aware.date(), until_aware.date(), page,
         )
 
         # Enrich each stub with full body
         articles: list[RawArticle] = []
-        for stub in all_stubs:
+        for i, stub in enumerate(all_stubs):
             article = self._enrich_with_api(stub)
             if article is not None:
                 articles.append(article)
+            if (i + 1) % 100 == 0:
+                logger.info("Habr: enriched %d / %d articles", i + 1, len(all_stubs))
 
-        logger.info("Habr: fetched %d articles", len(articles))
+        logger.info("Habr: fetched %d articles total", len(articles))
         return articles
 
     # ------------------------------------------------------------------
@@ -104,7 +126,7 @@ class HabrScraper(BaseScraper):
         try:
             resp = self.session.get(url, timeout=self.timeout)
             if resp.status_code == 404:
-                return []  # no more pages
+                return []
             resp.raise_for_status()
         except requests.RequestException as exc:
             logger.error("Habr RSS page %d failed: %s", page, exc)
@@ -196,7 +218,6 @@ class HabrScraper(BaseScraper):
     def _normalize_link(link: str) -> str:
         """Strip UTM and tracking query params, keep canonical URL."""
         parsed = urlparse(link)
-        # Keep only non-tracking params (drop utm_*, campaign etc.)
         kept = {
             k: v for k, v in parse_qs(parsed.query).items()
             if not k.startswith("utm_") and k not in ("campaign",)

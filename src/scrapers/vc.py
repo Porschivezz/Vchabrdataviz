@@ -41,58 +41,56 @@ class VcScraper(BaseScraper):
         until_aware = self._ensure_tz(until) if until else datetime.now(timezone.utc)
 
         articles: list[RawArticle] = []
+        last_sorting_value: str | int | None = None
         last_id: int | None = None
         reached_boundary = False
 
         for page_num in range(MAX_PAGES):
             params: dict = {"count": 20}
+            if last_sorting_value is not None:
+                params["lastSortingValue"] = last_sorting_value
             if last_id is not None:
-                params["last_id"] = last_id
-
-            # Try /timeline first, fall back to /feed if it fails
-            endpoint = f"{VC_API_BASE}/timeline"
+                params["lastId"] = last_id
 
             try:
-                resp = self.session.get(endpoint, params=params, timeout=self.timeout)
-                if resp.status_code == 404:
-                    resp = self.session.get(
-                        f"{VC_API_BASE}/feed", params=params, timeout=self.timeout
-                    )
+                resp = self.session.get(
+                    f"{VC_API_BASE}/timeline",
+                    params=params,
+                    timeout=self.timeout,
+                )
                 resp.raise_for_status()
                 data = resp.json()
             except requests.RequestException as exc:
                 logger.error("VC.ru API request failed: %s", exc)
                 break
 
-            # Log raw structure on first page to help diagnose format issues
-            if page_num == 0:
-                result_type = type(data.get("result")).__name__
-                result_keys = (
-                    list(data.get("result", {}).keys())
-                    if isinstance(data.get("result"), dict)
-                    else "—"
-                )
-                logger.info(
-                    "VC.ru API response keys: %s, result type: %s, result keys: %s",
-                    list(data.keys()),
-                    result_type,
-                    result_keys,
-                )
-
             result = data.get("result", {})
-            if isinstance(result, list):
-                items = result
-                next_last_id = None
-            elif isinstance(result, dict):
-                # Handle both "items" and "data" sub-keys
-                items = result.get("items", result.get("data", []))
-                next_last_id = result.get("last_id", result.get("lastId"))
-            else:
-                logger.warning("VC.ru: unexpected result type: %s, data=%r", type(result), str(data)[:300])
+            if not isinstance(result, dict):
+                logger.warning("VC.ru: result is not a dict: %s", type(result))
                 break
 
+            items = result.get("items", [])
+            new_last_id = result.get("lastId")
+            new_last_sorting = result.get("lastSortingValue")
+
+            # First page: log structure for diagnostics
+            if page_num == 0:
+                logger.info(
+                    "VC.ru page 0: %d items, lastId=%s, lastSortingValue=%s",
+                    len(items), new_last_id, new_last_sorting,
+                )
+                if items and isinstance(items[0], dict):
+                    first = items[0]
+                    logger.info(
+                        "VC.ru first item keys: %s", sorted(first.keys())
+                    )
+                    # Log all date-like fields
+                    for k in ["date", "dateRFC", "date_rfc", "created", "sortingValue"]:
+                        if k in first:
+                            logger.info("VC.ru first item %s = %r", k, first[k])
+
             if not items:
-                logger.info("VC.ru: empty items on page %d (result keys: %s)", page_num, list(result.keys()) if isinstance(result, dict) else type(result))
+                logger.info("VC.ru: no items on page %d", page_num)
                 break
 
             for item in items:
@@ -101,10 +99,17 @@ class VcScraper(BaseScraper):
 
                 pub_dt = self._extract_date(item)
 
+                # Log first item's parsed date on first page
+                if page_num == 0 and item is items[0]:
+                    logger.info(
+                        "VC.ru first item parsed date: %s (until=%s, since=%s)",
+                        pub_dt, until_aware, since_aware,
+                    )
+
                 if pub_dt is not None:
                     pub_aware = self._ensure_tz(pub_dt)
                     if pub_aware > until_aware:
-                        continue  # too new, keep going
+                        continue  # too new
                     if pub_aware < since_aware:
                         reached_boundary = True
                         break
@@ -116,20 +121,12 @@ class VcScraper(BaseScraper):
             if reached_boundary:
                 break
 
-            # Pagination
-            if next_last_id is not None:
-                if next_last_id == last_id:
-                    break
-                last_id = next_last_id
-            elif items:
-                last_item = items[-1]
-                if isinstance(last_item, dict):
-                    new_id = last_item.get("id")
-                    if new_id is None or new_id == last_id:
-                        break
-                    last_id = new_id
-                else:
-                    break
+            # Pagination via lastSortingValue + lastId (VC.ru's actual mechanism)
+            if new_last_sorting is not None and new_last_sorting != last_sorting_value:
+                last_sorting_value = new_last_sorting
+                last_id = new_last_id
+            elif new_last_id is not None and new_last_id != last_id:
+                last_id = new_last_id
             else:
                 break
 
@@ -142,7 +139,14 @@ class VcScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     def _extract_date(self, entry: dict) -> datetime | None:
-        return self._parse_date(entry.get("date", entry.get("date_rfc")))
+        """Try multiple date fields; handle both seconds and milliseconds timestamps."""
+        for field in ("date", "dateRFC", "date_rfc", "created"):
+            val = entry.get(field)
+            if val is not None:
+                parsed = self._parse_date(val)
+                if parsed is not None:
+                    return parsed
+        return None
 
     def _parse_entry(self, entry: dict) -> RawArticle | None:
         try:
@@ -235,10 +239,21 @@ class VcScraper(BaseScraper):
         if value is None:
             return None
         if isinstance(value, (int, float)):
+            # Handle both seconds and milliseconds timestamps
+            if value > 1e12:
+                value = value / 1000.0
             return datetime.fromtimestamp(value, tz=timezone.utc)
         if isinstance(value, str):
             try:
                 return datetime.fromisoformat(value)
             except ValueError:
-                return None
+                pass
+            # Try parsing as numeric string
+            try:
+                ts = float(value)
+                if ts > 1e12:
+                    ts = ts / 1000.0
+                return datetime.fromtimestamp(ts, tz=timezone.utc)
+            except (ValueError, OSError):
+                pass
         return None
