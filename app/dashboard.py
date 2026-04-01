@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -153,6 +154,30 @@ def _semantic_search(query_embedding: list[float], top_k: int = 10) -> list[dict
         session.close()
 
 
+def _get_articles_per_day() -> pd.DataFrame:
+    """Articles per day per source already in DB."""
+    session = get_session()
+    try:
+        rows = session.execute(
+            text(
+                """
+                SELECT source,
+                       DATE(published_at) AS day,
+                       COUNT(*) AS cnt
+                FROM articles
+                WHERE published_at IS NOT NULL
+                GROUP BY source, DATE(published_at)
+                ORDER BY day
+                """
+            )
+        ).fetchall()
+        if not rows:
+            return pd.DataFrame(columns=["source", "day", "cnt"])
+        return pd.DataFrame(rows, columns=["source", "day", "cnt"])
+    finally:
+        session.close()
+
+
 # ===================================================================
 # PUBLIC DASHBOARD
 # ===================================================================
@@ -264,10 +289,32 @@ elif page == "Admin Panel":
     st.subheader("Ingestion Stats")
     counts = _get_status_counts()
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("PENDING", counts.get("PENDING", 0))
     c2.metric("QUEUED", counts.get("QUEUED_FOR_ANALYSIS", 0))
     c3.metric("ANALYZED", counts.get("ANALYZED", 0))
+    total_in_db = sum(counts.values())
+    c4.metric("Total in DB", total_in_db)
+
+    # --- DB coverage info ---
+    st.subheader("Database Coverage")
+    from src.services.ingestion_service import get_db_date_coverage
+    coverage = get_db_date_coverage()
+
+    if coverage["total"] > 0:
+        cov1, cov2, cov3 = st.columns(3)
+        cov1.metric("Earliest article", str(coverage["min_date"].date()) if coverage["min_date"] else "—")
+        cov2.metric("Latest article", str(coverage["max_date"].date()) if coverage["max_date"] else "—")
+        per_src = coverage.get("per_source", {})
+        cov3.metric("Sources", ", ".join(f"{s}: {n}" for s, n in per_src.items()) or "—")
+
+        # Per-day chart
+        day_df = _get_articles_per_day()
+        if not day_df.empty:
+            pivot = day_df.pivot_table(index="day", columns="source", values="cnt", fill_value=0)
+            st.bar_chart(pivot)
+    else:
+        st.info("Database is empty. Run ingestion to start collecting articles.")
 
     # --- Cost estimation ---
     st.subheader("Cost Estimation for Pending Articles")
@@ -290,14 +337,46 @@ elif page == "Admin Panel":
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.markdown("**Ingest New Articles**")
-        ingest_limit = st.number_input("Articles per source", min_value=1, max_value=100, value=20)
+        st.markdown("**Ingest Articles by Date Range**")
+
+        preset = st.selectbox(
+            "Quick period",
+            ["Last 24 hours", "Last 3 days", "Last 7 days", "Last 30 days", "Custom range"],
+            key="ingest_preset",
+        )
+
+        today = date.today()
+
+        if preset == "Custom range":
+            d_col1, d_col2 = st.columns(2)
+            with d_col1:
+                since_date = st.date_input("From", value=today - timedelta(days=1), key="since")
+            with d_col2:
+                until_date = st.date_input("To", value=today, key="until")
+        else:
+            days_map = {
+                "Last 24 hours": 1,
+                "Last 3 days": 3,
+                "Last 7 days": 7,
+                "Last 30 days": 30,
+            }
+            days = days_map[preset]
+            since_date = today - timedelta(days=days)
+            until_date = today
+            st.caption(f"Period: **{since_date}** — **{until_date}**")
+
         if st.button("Run Ingestion", type="primary"):
-            with st.spinner("Scraping articles..."):
+            since_dt = datetime.combine(since_date, datetime.min.time(), tzinfo=timezone.utc)
+            until_dt = datetime.combine(until_date, datetime.max.time(), tzinfo=timezone.utc)
+
+            with st.spinner(f"Scraping articles from {since_date} to {until_date}..."):
                 from src.services.ingestion_service import ingest_all
-                stats = ingest_all(limit_per_source=ingest_limit)
+                stats = ingest_all(since=since_dt, until=until_dt)
+
             st.success(
-                f"Done! New: {stats['new']}, Queued: {stats['queued']}, Skipped: {stats['skipped']}"
+                f"Done! Found {stats['total_fetched']} articles in range. "
+                f"New: {stats['new']} (auto-queued: {stats['queued']}), "
+                f"Already in DB: {stats['skipped']}"
             )
             st.rerun()
 
@@ -335,7 +414,7 @@ elif page == "Admin Panel":
     try:
         all_articles = (
             session.execute(
-                select(Article).order_by(Article.created_at.desc()).limit(50)
+                select(Article).order_by(Article.created_at.desc()).limit(100)
             )
             .scalars()
             .all()

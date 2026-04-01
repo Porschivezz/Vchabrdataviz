@@ -22,6 +22,15 @@ class BaseScraper(ABC):
     """Every concrete scraper must implement ``fetch_articles``."""
 
     @abstractmethod
-    def fetch_articles(self, *, limit: int = 20) -> list[RawArticle]:
-        """Return a batch of recent articles from the source."""
+    def fetch_articles(
+        self,
+        *,
+        since: datetime,
+        until: datetime | None = None,
+    ) -> list[RawArticle]:
+        """Return all articles published in [since, until].
+
+        The scraper must paginate backwards until it reaches articles older
+        than ``since``, then stop.  Articles outside the range are discarded.
+        """
         ...

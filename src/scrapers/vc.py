@@ -1,4 +1,4 @@
-"""VC.ru scraper using the public JSON API."""
+"""VC.ru scraper using the public JSON API — date-range based."""
 
 from __future__ import annotations
 
@@ -13,10 +13,11 @@ from src.scrapers.base import BaseScraper, RawArticle
 logger = logging.getLogger(__name__)
 
 VC_API_BASE = "https://api.vc.ru/v2.8"
+MAX_PAGES = 100  # safety limit
 
 
 class VcScraper(BaseScraper):
-    """Fetches articles from VC.ru via its public API (``/v2.8``)."""
+    """Fetches all VC.ru articles within a given date range."""
 
     def __init__(self, timeout: int = 30) -> None:
         self.timeout = timeout
@@ -30,12 +31,21 @@ class VcScraper(BaseScraper):
             "Referer": "https://vc.ru/",
         })
 
-    def fetch_articles(self, *, limit: int = 20) -> list[RawArticle]:
+    def fetch_articles(
+        self,
+        *,
+        since: datetime,
+        until: datetime | None = None,
+    ) -> list[RawArticle]:
+        since_aware = self._ensure_tz(since)
+        until_aware = self._ensure_tz(until) if until else datetime.now(timezone.utc)
+
         articles: list[RawArticle] = []
         last_id: int | None = None
+        reached_boundary = False
 
-        while len(articles) < limit:
-            params: dict = {"count": min(limit - len(articles), 20), "allSite": 1}
+        for page_num in range(MAX_PAGES):
+            params: dict = {"count": 20, "allSite": 1}
             if last_id is not None:
                 params["last_id"] = last_id
 
@@ -51,8 +61,6 @@ class VcScraper(BaseScraper):
                 logger.error("VC.ru API request failed: %s", exc)
                 break
 
-            # VC.ru response: {"result": {"items": [...], "last_id": N}}
-            # or {"result": [...]}  — handle both
             result = data.get("result", {})
             if isinstance(result, list):
                 items = result
@@ -65,26 +73,35 @@ class VcScraper(BaseScraper):
                 break
 
             if not items:
-                logger.info("VC.ru: no more items")
                 break
 
             for item in items:
                 if not isinstance(item, dict):
-                    logger.debug("VC.ru: skipping non-dict item: %r", item)
                     continue
-                if len(articles) >= limit:
-                    break
+
+                pub_dt = self._extract_date(item)
+
+                if pub_dt is not None:
+                    pub_aware = self._ensure_tz(pub_dt)
+                    if pub_aware > until_aware:
+                        continue  # too new, keep going
+                    if pub_aware < since_aware:
+                        reached_boundary = True
+                        break
+
                 article = self._parse_entry(item)
                 if article is not None:
                     articles.append(article)
 
+            if reached_boundary:
+                break
+
             # Pagination
             if next_last_id is not None:
                 if next_last_id == last_id:
-                    break  # no progress
+                    break
                 last_id = next_last_id
             elif items:
-                # Fall back: use last item's id
                 last_item = items[-1]
                 if isinstance(last_item, dict):
                     new_id = last_item.get("id")
@@ -96,8 +113,16 @@ class VcScraper(BaseScraper):
             else:
                 break
 
-        logger.info("VC.ru: fetched %d articles", len(articles))
+        logger.info(
+            "VC.ru: fetched %d articles in range %s – %s (pages: %d)",
+            len(articles), since_aware.date(), until_aware.date(), page_num + 1,
+        )
         return articles
+
+    # ------------------------------------------------------------------
+
+    def _extract_date(self, entry: dict) -> datetime | None:
+        return self._parse_date(entry.get("date", entry.get("date_rfc")))
 
     def _parse_entry(self, entry: dict) -> RawArticle | None:
         try:
@@ -105,9 +130,7 @@ class VcScraper(BaseScraper):
             title = entry.get("title", "").strip()
             link = entry.get("url", f"https://vc.ru/p/{entry_id}")
 
-            date_ts = entry.get("date", entry.get("date_rfc"))
-            published_at = self._parse_date(date_ts)
-
+            published_at = self._extract_date(entry)
             raw_text = self._extract_text(entry)
 
             tags: list[str] = []
@@ -147,7 +170,6 @@ class VcScraper(BaseScraper):
         if intro:
             parts.append(self._html_to_text(intro) if "<" in intro else intro)
 
-        # Blocks-based content
         for block in entry.get("blocks", []):
             if not isinstance(block, dict):
                 continue
@@ -162,7 +184,6 @@ class VcScraper(BaseScraper):
                         self._html_to_text(text_val) if "<" in text_val else text_val
                     )
 
-        # Fallback: entryContent
         if not parts:
             entry_content = entry.get("entryContent", {})
             if isinstance(entry_content, dict):
@@ -171,6 +192,16 @@ class VcScraper(BaseScraper):
                     parts.append(self._html_to_text(html_body))
 
         return "\n".join(p for p in parts if p)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ensure_tz(dt: datetime) -> datetime:
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
 
     @staticmethod
     def _html_to_text(html: str) -> str:

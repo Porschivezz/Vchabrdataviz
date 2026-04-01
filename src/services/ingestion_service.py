@@ -1,10 +1,11 @@
-"""Ingestion service: scrape articles, apply auto-trigger logic, persist to DB."""
+"""Ingestion service: scrape articles by date range, auto-trigger, persist."""
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from src.core.config import settings
@@ -30,15 +31,20 @@ def should_auto_analyze(tags: list[str], keywords: list[str]) -> bool:
     return False
 
 
-def ingest_from_scraper(scraper: BaseScraper, limit: int = 20) -> dict:
-    """Run a scraper and persist new articles.
+def ingest_from_scraper(
+    scraper: BaseScraper,
+    *,
+    since: datetime,
+    until: datetime | None = None,
+) -> dict:
+    """Run a scraper for a date range and persist new articles.
 
-    Returns a summary dict: {"new": int, "skipped": int, "queued": int}.
+    Returns {"new": int, "skipped": int, "queued": int, "total_fetched": int}.
     """
-    raw_articles = scraper.fetch_articles(limit=limit)
+    raw_articles = scraper.fetch_articles(since=since, until=until)
     keywords = settings.keywords_list
 
-    stats = {"new": 0, "skipped": 0, "queued": 0}
+    stats = {"new": 0, "skipped": 0, "queued": 0, "total_fetched": len(raw_articles)}
     session: Session = get_session()
 
     try:
@@ -52,7 +58,8 @@ def ingest_from_scraper(scraper: BaseScraper, limit: int = 20) -> dict:
         session.close()
 
     logger.info(
-        "Ingestion complete: %d new (%d queued), %d skipped",
+        "Ingestion complete: fetched %d, new %d (queued %d), skipped %d",
+        stats["total_fetched"],
         stats["new"],
         stats["queued"],
         stats["skipped"],
@@ -66,7 +73,6 @@ def _ingest_one(
     keywords: list[str],
     stats: dict,
 ) -> None:
-    # Check for duplicate by link
     existing = session.execute(
         select(Article.id).where(Article.link == raw.link)
     ).scalar_one_or_none()
@@ -97,19 +103,52 @@ def _ingest_one(
     stats["new"] += 1
 
 
-def ingest_all(limit_per_source: int = 20) -> dict:
-    """Convenience: run all registered scrapers."""
+def ingest_all(
+    *,
+    since: datetime,
+    until: datetime | None = None,
+) -> dict:
+    """Run all registered scrapers for a date range."""
     from src.scrapers.habr import HabrScraper
     from src.scrapers.vc import VcScraper
 
-    total_stats = {"new": 0, "skipped": 0, "queued": 0}
+    total_stats = {"new": 0, "skipped": 0, "queued": 0, "total_fetched": 0}
 
     for scraper in [HabrScraper(), VcScraper()]:
         try:
-            s = ingest_from_scraper(scraper, limit=limit_per_source)
+            s = ingest_from_scraper(scraper, since=since, until=until)
             for k in total_stats:
                 total_stats[k] += s[k]
         except Exception as exc:
             logger.error("Scraper %s failed: %s", type(scraper).__name__, exc)
 
     return total_stats
+
+
+def get_db_date_coverage() -> dict:
+    """Return min/max published_at dates and per-day counts in DB."""
+    session: Session = get_session()
+    try:
+        row = session.execute(
+            select(
+                func.min(Article.published_at),
+                func.max(Article.published_at),
+                func.count(Article.id),
+            )
+        ).one()
+        min_date, max_date, total = row
+
+        # Per-source counts
+        source_rows = session.execute(
+            select(Article.source, func.count(Article.id)).group_by(Article.source)
+        ).all()
+        per_source = {src: cnt for src, cnt in source_rows}
+
+        return {
+            "min_date": min_date,
+            "max_date": max_date,
+            "total": total,
+            "per_source": per_source,
+        }
+    finally:
+        session.close()
