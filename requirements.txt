@@ -20,3 +20,4 @@ umap-learn>=0.5,<1.0
 plotly>=5.18,<6.0
 streamlit-agraph>=0.0.45
 python-telegram-bot>=21.0,<22.0
+feedparser>=6.0,<7.0

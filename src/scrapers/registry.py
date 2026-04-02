@@ -51,9 +51,10 @@ def get_enabled_sources() -> dict[str, SourceConfig]:
 
 
 def _init_default_sources() -> None:
-    """Register built-in sources (Habr, VC.ru)."""
+    """Register built-in sources (Habr, VC.ru + 17 news outlets)."""
     from src.scrapers.habr import HabrScraper
     from src.scrapers.vc import VcScraper
+    from src.scrapers.news_sources import NEWS_SOURCES
 
     register_source(SourceConfig(
         name="habr",
@@ -71,6 +72,17 @@ def _init_default_sources() -> None:
         description="VC.ru — бизнес и технологии",
         icon="💼",
     ))
+
+    # Register all Russian news sources
+    for src in NEWS_SOURCES:
+        register_source(SourceConfig(
+            name=src["name"],
+            scraper_class=src["scraper_class"],
+            enabled=True,
+            poll_interval_minutes=15,
+            description=src["description"],
+            icon=src["icon"],
+        ))
 
 
 def load_telegram_channels_from_db() -> None:
