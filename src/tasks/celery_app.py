@@ -24,16 +24,19 @@ app.conf.update(
     worker_prefetch_multiplier=1,
 )
 
-# Beat schedule for periodic tasks
+# Beat schedule: staggered polling every 5 minutes
 app.conf.beat_schedule = {
-    "poll-all-sources-every-30min": {
+    # Minute 0,15,30,45: poll all sources (staggered internally)
+    "poll-all-sources-every-15min": {
         "task": "src.tasks.jobs.poll_all_sources",
-        "schedule": crontab(minute="*/30"),
-    },
-    "auto-analyze-queued-every-15min": {
-        "task": "src.tasks.jobs.auto_analyze_queued",
         "schedule": crontab(minute="*/15"),
     },
+    # Minute 5,20,35,50: auto-analyze queued articles
+    "auto-analyze-queued": {
+        "task": "src.tasks.jobs.auto_analyze_queued",
+        "schedule": crontab(minute="5,20,35,50"),
+    },
+    # Daily digest at 6:00 AM UTC
     "generate-daily-digest-at-6am": {
         "task": "src.tasks.jobs.generate_daily_digest",
         "schedule": crontab(hour=6, minute=0),

@@ -51,6 +51,20 @@ def init_db() -> None:
         conn.execute(text(
             "ALTER TABLE articles ADD COLUMN IF NOT EXISTS relations JSONB"
         ))
+        # Create telegram_channels table if not exists (handled by create_all,
+        # but ensure columns exist for upgrades)
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS telegram_channels ("
+            "  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),"
+            "  username VARCHAR(128) NOT NULL UNIQUE,"
+            "  title TEXT,"
+            "  enabled BOOLEAN NOT NULL DEFAULT TRUE,"
+            "  last_message_id INTEGER,"
+            "  created_at TIMESTAMP NOT NULL DEFAULT NOW(),"
+            "  last_fetched_at TIMESTAMP,"
+            "  post_count INTEGER NOT NULL DEFAULT 0"
+            ")"
+        ))
         # Add GIN index for FTS (hybrid search)
         conn.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_articles_fts "

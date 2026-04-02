@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.core.config import settings
 from src.core.database import get_session, init_db
-from src.core.models import Article, DailyDigest, IngestionRun
+from src.core.models import Article, DailyDigest, IngestionRun, TelegramChannel
 from app.styles import inject_glassmorphism, glass_card, neon_header
 
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +42,12 @@ _init_database()
 
 st.set_page_config(page_title="Пульс Рунета", page_icon="📡", layout="wide")
 inject_glassmorphism()
+
+# Auto-refresh every 5 minutes so dashboard stays live
+st.markdown(
+    '<meta http-equiv="refresh" content="300">',
+    unsafe_allow_html=True,
+)
 
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
@@ -665,8 +671,8 @@ elif page == "Админ-панель":
         st.warning("Войдите через боковую панель для доступа.")
         st.stop()
 
-    tab_ov, tab_ing, tab_an, tab_dig, tab_src, tab_runs = st.tabs(
-        ["Обзор", "Сбор", "Анализ", "Дайджесты", "Источники", "Запуски"]
+    tab_ov, tab_ing, tab_an, tab_tg, tab_dig, tab_src, tab_runs = st.tabs(
+        ["Обзор", "Сбор", "Анализ", "Telegram-каналы", "Дайджесты", "Источники", "Запуски"]
     )
 
     with tab_ov:
@@ -787,6 +793,137 @@ elif page == "Админ-панель":
                 n = analyze_by_date_range(OpenRouterProvider(), since=as_dt, until=au_dt, statuses=scope_m[a_scope])
             st.success(f"Проанализировано {n} / {pcount} статей.")
             st.rerun()
+
+    with tab_tg:
+        neon_header("💬 Telegram-каналы", 3)
+        st.caption("Добавьте публичные Telegram-каналы для мониторинга. Посты будут собираться автоматически каждые 15 минут.")
+
+        # Show existing channels
+        ses_tg = get_session()
+        try:
+            channels = ses_tg.execute(
+                select(TelegramChannel).order_by(TelegramChannel.created_at.desc())
+            ).scalars().all()
+        finally:
+            ses_tg.close()
+
+        if channels:
+            neon_header("📋 Подключённые каналы", 3)
+            for ch in channels:
+                status_icon = "🟢" if ch.enabled else "🔴"
+                last_fetch = ch.last_fetched_at.strftime("%d.%m %H:%M") if ch.last_fetched_at else "никогда"
+                with st.expander(f"{status_icon} @{ch.username} — {ch.title or '?'} | Постов: {ch.post_count} | Посл. сбор: {last_fetch}"):
+                    tc1, tc2, tc3 = st.columns(3)
+                    tc1.write(f"**Канал:** [@{ch.username}](https://t.me/{ch.username})")
+                    tc2.write(f"**Добавлен:** {ch.created_at.strftime('%d.%m.%Y %H:%M')}")
+                    tc3.write(f"**Статус:** {'Включён' if ch.enabled else 'Выключен'}")
+
+                    bc1, bc2 = st.columns(2)
+                    with bc1:
+                        if ch.enabled:
+                            if st.button(f"⏸ Выключить", key=f"disable_{ch.username}"):
+                                ses2 = get_session()
+                                try:
+                                    ses2.execute(text(
+                                        "UPDATE telegram_channels SET enabled = FALSE WHERE username = :u"
+                                    ), {"u": ch.username})
+                                    ses2.commit()
+                                finally:
+                                    ses2.close()
+                                from src.scrapers.registry import reload_all_sources
+                                reload_all_sources()
+                                st.rerun()
+                        else:
+                            if st.button(f"▶ Включить", key=f"enable_{ch.username}"):
+                                ses2 = get_session()
+                                try:
+                                    ses2.execute(text(
+                                        "UPDATE telegram_channels SET enabled = TRUE WHERE username = :u"
+                                    ), {"u": ch.username})
+                                    ses2.commit()
+                                finally:
+                                    ses2.close()
+                                from src.scrapers.registry import reload_all_sources
+                                reload_all_sources()
+                                st.rerun()
+                    with bc2:
+                        if st.button(f"🗑 Удалить", key=f"del_{ch.username}"):
+                            ses2 = get_session()
+                            try:
+                                ses2.execute(text(
+                                    "DELETE FROM telegram_channels WHERE username = :u"
+                                ), {"u": ch.username})
+                                ses2.commit()
+                            finally:
+                                ses2.close()
+                            from src.scrapers.registry import reload_all_sources
+                            reload_all_sources()
+                            st.rerun()
+
+        st.markdown("---")
+        neon_header("➕ Добавить канал", 3)
+
+        new_channel = st.text_input(
+            "Ссылка на канал или @username",
+            placeholder="https://t.me/russicaRU или @ejdailyru",
+            key="new_tg_channel",
+        )
+
+        if st.button("Тестировать и добавить", type="primary", key="add_tg"):
+            if new_channel:
+                import re as _re
+                # Extract username from URL or @mention
+                channel_input = new_channel.strip()
+                m = _re.search(r"t\.me/(\w+)", channel_input)
+                if m:
+                    username = m.group(1)
+                elif channel_input.startswith("@"):
+                    username = channel_input.lstrip("@")
+                else:
+                    username = channel_input
+
+                with st.spinner(f"Тестируем канал @{username}..."):
+                    from src.scrapers.telegram_channel import test_channel
+                    result = test_channel(username)
+
+                if result["ok"]:
+                    # Save to DB
+                    ses2 = get_session()
+                    try:
+                        from sqlalchemy.dialects.postgresql import insert as pg_insert
+                        stmt = (
+                            pg_insert(TelegramChannel)
+                            .values(
+                                username=username,
+                                title=result["title"],
+                                enabled=True,
+                                post_count=result["post_count"],
+                            )
+                            .on_conflict_do_update(
+                                constraint="uq_tg_channel_username",
+                                set_={"title": result["title"], "enabled": True},
+                            )
+                        )
+                        ses2.execute(stmt)
+                        ses2.commit()
+                    finally:
+                        ses2.close()
+
+                    # Reload registry
+                    from src.scrapers.registry import reload_all_sources
+                    reload_all_sources()
+
+                    st.success(
+                        f"✅ Канал @{username} добавлен!\n\n"
+                        f"**Название:** {result['title']}\n"
+                        f"**Постов за 7 дней:** {result['post_count']}\n"
+                        f"**Последний пост:** {result['latest_post'][:80]}"
+                    )
+                    st.rerun()
+                else:
+                    st.error(f"❌ Ошибка: {result['error']}")
+            else:
+                st.warning("Введите ссылку на канал")
 
     with tab_dig:
         neon_header("📰 Генерация дайджеста", 3)
