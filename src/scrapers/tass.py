@@ -1,8 +1,8 @@
-"""ТАСС (tass.ru) — dedicated scraper.
+"""ТАСС (tass.ru) — adapted from working production parser.
 
-TASS uses Next.js with server-side rendering. Article text is embedded
-in <script id="__NEXT_DATA__"> as JSON and also in JSON-LD.
-This scraper extracts text from those sources when CSS selectors fail.
+Uses RSS feeds (including section-specific) for article discovery,
+then fetches each article page and extracts text from <p> tags
+inside known content containers.
 """
 
 from __future__ import annotations
@@ -17,14 +17,41 @@ import requests
 from bs4 import BeautifulSoup
 
 from src.scrapers.base import BaseScraper, RawArticle
-from src.scrapers.rss_scraper import _ensure_tz, _parse_datetime, _extract_largest_text_block
+from src.scrapers.rss_scraper import _ensure_tz, _parse_datetime
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+TASS_HOME = "https://tass.ru"
+
+# RSS feeds — main + section-specific
+RSS_FEEDS = [
+    f"{TASS_HOME}/rss/v2.xml",
+    f"{TASS_HOME}/rss/v2.xml?sections=MEhvM9YoKE4",  # Политика
+    f"{TASS_HOME}/rss/v2.xml?sections=T1BvM9YCjLk",  # Экономика
+    f"{TASS_HOME}/rss/v2.xml?sections=SurvM9YC7RI",  # Общество
+    f"{TASS_HOME}/rss/v2.xml?sections=QE5vM9YCE3M",  # Мир
+    f"{TASS_HOME}/rss/v2.xml?sections=vDFvM9Ycjuk",  # Наука
+]
+
+EXCLUDED_PREFIXES = (
+    "/info/", "/tag/", "/author/", "/search", "/spec/",
+    "/press/", "/podcasts/", "/video/", "/photo/", "/rss",
+)
+
+
+def _is_article_url(href: str) -> bool:
+    """Check if URL is a TASS article page."""
+    if not href.startswith(TASS_HOME):
+        return False
+    path = href[len(TASS_HOME):]
+    if any(path.startswith(p) for p in EXCLUDED_PREFIXES):
+        return False
+    return bool(re.match(r"^/[\w-]+(/[\w-]+)?/\d+$", path))
+
 
 class TassScraper(BaseScraper):
-    """ТАСС — полный парсер с извлечением текстов статей."""
+    """ТАСС — парсер на основе рабочего продакшн-парсера."""
 
     def __init__(self, timeout: int = 30) -> None:
         self.timeout = timeout
@@ -36,7 +63,6 @@ class TassScraper(BaseScraper):
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": "https://tass.ru/",
         })
         proxy_url = settings.scraper_proxy_url.strip()
         if proxy_url:
@@ -51,398 +77,306 @@ class TassScraper(BaseScraper):
         since_aware = _ensure_tz(since)
         until_aware = _ensure_tz(until) if until else datetime.now(timezone.utc)
 
-        # Step 1: Get article stubs from RSS
-        stubs = self._fetch_rss(since_aware, until_aware)
-        logger.info("TASS: %d stubs from RSS", len(stubs))
+        # Step 1: Discover article URLs from all RSS feeds
+        discovered = self._discover_from_rss(since_aware, until_aware)
+        logger.info("TASS: discovered %d article URLs from RSS", len(discovered))
 
-        # Step 2: If RSS gave nothing, try HTML listing pages
-        if not stubs:
-            logger.info("TASS: RSS empty, trying HTML listing pages")
-            stubs = self._fetch_html_listing(since_aware, until_aware)
-            logger.info("TASS: %d stubs from HTML listing", len(stubs))
+        if not discovered:
+            # Fallback to HTML listing
+            discovered = self._discover_from_html(since_aware, until_aware)
+            logger.info("TASS: discovered %d URLs from HTML listing", len(discovered))
 
-        # Step 3: Fetch full text for each article
+        # Step 2: Fetch and parse each article
         articles: list[RawArticle] = []
-        for i, stub in enumerate(stubs):
-            full_text = self._fetch_article_text(stub["link"])
-
-            raw_text = full_text if full_text else stub.get("description", "")
-            if not raw_text and not stub["title"]:
-                continue
-
-            articles.append(RawArticle(
-                source="tass",
-                title=stub["title"],
-                link=stub["link"],
-                published_at=stub.get("published_at"),
-                raw_text=raw_text,
-                native_tags=stub.get("tags", []),
-            ))
+        for i, stub in enumerate(discovered):
+            article = self._parse_article(stub, since_aware, until_aware)
+            if article:
+                articles.append(article)
 
             if (i + 1) % 20 == 0:
-                logger.info("TASS: enriched %d/%d articles", i + 1, len(stubs))
-            if (i + 1) % 10 == 0:
-                time.sleep(0.5)
+                logger.info("TASS: parsed %d/%d, accepted %d",
+                            i + 1, len(discovered), len(articles))
+            if (i + 1) % 5 == 0:
+                time.sleep(0.3)
 
         full_count = sum(1 for a in articles if len(a.raw_text) > 300)
-        logger.info(
-            "TASS TOTAL: %d articles, %d with full text",
-            len(articles), full_count,
-        )
+        logger.info("TASS TOTAL: %d articles, %d with full text", len(articles), full_count)
         return articles
 
     # ------------------------------------------------------------------
-    # RSS fetching
+    # Article discovery
     # ------------------------------------------------------------------
 
-    def _fetch_rss(self, since: datetime, until: datetime) -> list[dict]:
-        """Fetch article stubs from TASS RSS feed."""
-        import warnings
-        from bs4 import XMLParsedAsHTMLWarning
-        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
-
-        resp = None
-        for attempt in range(3):
-            try:
-                resp = self.session.get(
-                    "https://tass.ru/rss/v2.xml",
-                    timeout=self.timeout,
-                )
-                if resp.status_code == 429:
-                    time.sleep(2 ** attempt * 2)
-                    continue
-                resp.raise_for_status()
-                break
-            except requests.RequestException as exc:
-                if attempt < 2:
-                    time.sleep(1 + attempt)
-                    continue
-                logger.error("TASS RSS failed: %s", exc)
-                return []
-
-        if resp is None or resp.status_code != 200:
-            return []
-
-        # Use html.parser for reliable <link> text extraction from RSS
-        soup = BeautifulSoup(resp.content, "html.parser")
-        items = soup.find_all("item")
-
-        if not items:
-            soup = BeautifulSoup(resp.content, "xml")
-            items = soup.find_all("item")
-
-        logger.info("TASS RSS: found %d items", len(items))
-        if not items:
-            return []
-
+    def _discover_from_rss(self, since: datetime, until: datetime) -> list[dict]:
+        """Discover article URLs from multiple RSS feeds."""
         stubs: list[dict] = []
-        seen_links: set[str] = set()
+        seen: set[str] = set()
 
-        for item in items:
-            link = self._extract_link_from_item(item)
-            if not link or link in seen_links:
+        for feed_url in RSS_FEEDS:
+            try:
+                resp = self.session.get(feed_url, timeout=self.timeout)
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                logger.debug("TASS RSS %s failed: %s", feed_url, exc)
                 continue
 
-            pub_dt = None
-            for tag_name in ("pubDate", "pubdate", "published", "updated"):
-                el = item.find(tag_name)
-                if el:
-                    text = el.get_text(strip=True)
-                    if text:
-                        pub_dt = _parse_datetime(text)
+            # Parse as XML first, fallback to html.parser
+            soup = BeautifulSoup(resp.content, "xml")
+            items = soup.find_all("item")
+            if not items:
+                soup = BeautifulSoup(resp.content, "html.parser")
+                items = soup.find_all("item")
+
+            for item in items:
+                # Extract link
+                link = ""
+                link_el = item.find("link")
+                if link_el:
+                    link = (link_el.get_text(strip=True)
+                            or (link_el.string and str(link_el.string).strip())
+                            or "")
+                if not link:
+                    # In html.parser, <link> is void — URL is next text node
+                    if link_el and link_el.next_sibling:
+                        sib = str(link_el.next_sibling).strip()
+                        if sib.startswith("http"):
+                            link = sib
+                if not link:
+                    guid_el = item.find("guid")
+                    if guid_el:
+                        g = guid_el.get_text(strip=True)
+                        if g.startswith("http"):
+                            link = g
+
+                if not link or not _is_article_url(link) or link in seen:
+                    continue
+                seen.add(link)
+
+                # Extract date
+                pub_dt = None
+                for tag_name in ("pubDate", "published", "updated"):
+                    el = item.find(tag_name)
+                    if el and el.get_text(strip=True):
+                        pub_dt = _parse_datetime(el.get_text(strip=True))
                         if pub_dt:
                             break
 
-            if pub_dt:
-                pub_aware = _ensure_tz(pub_dt)
-                if pub_aware > until or pub_aware < since:
-                    continue
+                if pub_dt:
+                    pub_aware = _ensure_tz(pub_dt)
+                    if pub_aware > until or pub_aware < since:
+                        continue
 
-            seen_links.add(link)
+                title_el = item.find("title")
+                title = title_el.get_text(strip=True) if title_el else ""
 
-            title_el = item.find("title")
-            title = title_el.get_text(strip=True) if title_el else ""
+                stubs.append({"link": link, "title": title, "published_at": pub_dt})
 
-            desc_el = item.find("description")
-            description = ""
-            if desc_el:
-                desc_raw = desc_el.string or desc_el.get_text(strip=True)
-                if desc_raw:
-                    if "<" in desc_raw:
-                        description = BeautifulSoup(desc_raw, "html.parser").get_text(
-                            separator="\n", strip=True
-                        )
-                    else:
-                        description = desc_raw.strip()
-
-            tags = []
-            for cat in item.find_all("category"):
-                t = cat.get("term", "") or cat.get_text(strip=True)
-                if t:
-                    tags.append(t)
-
-            stubs.append({
-                "title": title,
-                "link": link,
-                "published_at": pub_dt,
-                "description": description,
-                "tags": tags,
-            })
+            time.sleep(0.2)
 
         return stubs
 
-    def _extract_link_from_item(self, item) -> str:
-        """Extract article URL from RSS <item>."""
-        link_el = item.find("link")
-        if link_el:
-            text = link_el.get_text(strip=True)
-            if text and text.startswith("http"):
-                return text
-            if link_el.string and str(link_el.string).strip().startswith("http"):
-                return str(link_el.string).strip()
-            if link_el.next_sibling:
-                sib = str(link_el.next_sibling).strip()
-                if sib.startswith("http"):
-                    return sib
-            href = link_el.get("href", "")
-            if href:
-                return href.strip()
-
-        guid_el = item.find("guid")
-        if guid_el:
-            g = guid_el.get_text(strip=True)
-            if g.startswith("http"):
-                return g
-
-        return ""
-
-    # ------------------------------------------------------------------
-    # HTML listing fallback
-    # ------------------------------------------------------------------
-
-    def _fetch_html_listing(self, since: datetime, until: datetime) -> list[dict]:
-        """Scrape TASS section pages for article links."""
+    def _discover_from_html(self, since: datetime, until: datetime) -> list[dict]:
+        """Fallback: scrape TASS section pages for article links."""
         stubs: list[dict] = []
-        seen_links: set[str] = set()
+        seen: set[str] = set()
 
-        for section in ("", "/ekonomika", "/politika", "/obschestvo", "/mezhdunarodnaya-panorama"):
-            url = f"https://tass.ru{section}"
+        sections = [
+            "", "/ekonomika", "/politika", "/obschestvo",
+            "/mezhdunarodnaya-panorama", "/nauka",
+        ]
+        for section in sections:
+            url = f"{TASS_HOME}{section}"
             try:
                 resp = self.session.get(url, timeout=self.timeout)
                 resp.raise_for_status()
-            except requests.RequestException as exc:
-                logger.debug("TASS listing %s failed: %s", url, exc)
+            except requests.RequestException:
                 continue
 
             soup = BeautifulSoup(resp.text, "html.parser")
-
-            for a_tag in soup.find_all("a", href=True):
-                href = a_tag["href"]
-                if not re.match(r"^/[a-z-]+/\d{5,}$", href) and \
-                   not re.match(r"^/[a-z-]+/[a-z-]+/\d{5,}$", href):
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("/"):
+                    href = f"{TASS_HOME}{href}"
+                if not _is_article_url(href) or href in seen:
                     continue
+                seen.add(href)
 
-                full_link = f"https://tass.ru{href}"
-                if full_link in seen_links:
-                    continue
-                seen_links.add(full_link)
-
-                title = a_tag.get_text(strip=True) or ""
-                if len(title) < 5:
-                    parent = a_tag.parent
-                    if parent:
-                        title = parent.get_text(strip=True)
-
-                stubs.append({
-                    "title": title[:200] if title else "",
-                    "link": full_link,
-                    "published_at": None,
-                    "description": "",
-                    "tags": [],
-                })
+                title = a.get_text(strip=True)
+                stubs.append({"link": href, "title": title[:200], "published_at": None})
 
             time.sleep(0.3)
 
         return stubs
 
     # ------------------------------------------------------------------
-    # Full text extraction (Next.js aware)
+    # Article parsing (adapted from working production parser)
     # ------------------------------------------------------------------
 
-    def _fetch_article_text(self, url: str) -> str:
-        """Fetch full article text from a TASS article page.
+    def _parse_article(self, stub: dict, since: datetime, until: datetime) -> RawArticle | None:
+        """Fetch and parse a single TASS article page."""
+        url = stub["link"]
 
-        TASS uses Next.js SSR — article text may be in:
-        1. Visible HTML (CSS selectors)
-        2. <script id="__NEXT_DATA__"> JSON blob
-        3. <script type="application/ld+json"> structured data
-        4. Raw page text (smart fallback)
-        """
         try:
             resp = self.session.get(url, timeout=self.timeout)
             resp.raise_for_status()
         except requests.RequestException as exc:
-            logger.debug("TASS: failed to fetch %s: %s", url, exc)
-            return ""
+            logger.debug("TASS article %s failed: %s", url, exc)
+            return None
 
-        html = resp.text
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        # --- Method 1: Extract from __NEXT_DATA__ (Next.js SSR) ---
-        text = self._extract_from_next_data(soup)
-        if text and len(text) > 150:
-            return text
+        # --- Title ---
+        title = stub.get("title", "")
+        if not title:
+            for sel in ("h1.news-header__title", "h1[class*='title']", "h1"):
+                h1 = soup.select_one(sel)
+                if h1 and h1.get_text(strip=True):
+                    title = h1.get_text(strip=True)
+                    break
+            if not title:
+                og = soup.find("meta", attrs={"property": "og:title"})
+                if og:
+                    title = og.get("content", "")
 
-        # --- Method 2: Extract from JSON-LD ---
-        text = self._extract_from_jsonld(soup)
-        if text and len(text) > 150:
-            return text
+        # --- Lead/subtitle ---
+        lead = ""
+        for sel in ("div.news-header__lead", "div[class*='lead']", "p.lead"):
+            el = soup.select_one(sel)
+            if el and el.get_text(strip=True):
+                lead = el.get_text(strip=True)
+                break
 
-        # --- Method 3: Extract from raw JSON in page source ---
-        text = self._extract_from_page_json(html)
-        if text and len(text) > 150:
-            return text
+        # --- Body text: extract <p> tags from known content containers ---
+        # (adapted from working parser's content_nodes logic)
+        paragraphs: list[str] = []
 
-        # --- Method 4: CSS selectors (after removing noise) ---
-        for tag in soup.select("style, nav, iframe, noscript"):
-            tag.decompose()
-
-        for selector in (
-            "div.text-block",
+        # Try each container selector
+        for container_sel in (
             "div.text-content",
-            "article.news-text",
-            "div.news-article__text",
-            "div[itemprop='articleBody']",
-            "div.ds_content",
+            "div.news-body",
+            "div[class*='NewsBody']",
+            "article",
+            "div[class*='text']",
         ):
-            el = soup.select_one(selector)
-            if el:
-                text = el.get_text(separator="\n", strip=True)
-                if text and len(text) > 150:
-                    return text
+            container = soup.select_one(container_sel)
+            if not container:
+                continue
 
-        # Multiple text-block elements
-        text_blocks = soup.select("div.text-block")
-        if text_blocks:
-            combined = "\n".join(
-                block.get_text(separator="\n", strip=True)
-                for block in text_blocks
-            )
-            if len(combined) > 150:
-                return combined
+            for p in container.find_all("p"):
+                # Skip captions, promos, ads
+                parent = p.parent
+                if parent:
+                    parent_class = " ".join(parent.get("class", []))
+                    if any(x in parent_class.lower() for x in
+                           ("caption", "promo", "advert", "related", "banner")):
+                        continue
 
-        # --- Method 5: Smart fallback — largest text-dense block ---
-        for tag in soup.select("script, header, footer, aside"):
-            tag.decompose()
+                text = p.get_text(strip=True)
+                if text and len(text) > 20:
+                    paragraphs.append(text)
 
-        text = _extract_largest_text_block(soup)
-        if text and len(text) > 200:
-            return text
+            if paragraphs:
+                break  # Found content, stop trying selectors
 
-        # --- Method 6: All substantial <p> tags ---
-        body = soup.find("body")
-        if body:
-            paragraphs = body.find_all("p")
-            p_text = "\n".join(
-                p.get_text(strip=True)
-                for p in paragraphs
-                if len(p.get_text(strip=True)) > 30
-            )
-            if len(p_text) > 200:
-                return p_text
+        body_text = "\n\n".join(paragraphs)
 
-        return ""
+        # --- Fallback: JSON-LD articleBody ---
+        if not body_text or len(body_text) < 100:
+            for script in soup.find_all("script", type="application/ld+json"):
+                if not script.string:
+                    continue
+                try:
+                    data = json.loads(script.string)
+                    items = data if isinstance(data, list) else [data]
+                    for item in items:
+                        if isinstance(item, dict):
+                            ab = item.get("articleBody", "")
+                            if ab and len(ab) > len(body_text):
+                                body_text = ab
+                except (json.JSONDecodeError, KeyError):
+                    continue
 
-    def _extract_from_next_data(self, soup: BeautifulSoup) -> str:
-        """Extract article text from Next.js __NEXT_DATA__ JSON."""
-        script = soup.find("script", id="__NEXT_DATA__")
-        if not script or not script.string:
-            return ""
+        # Combine lead + body
+        if lead and lead not in body_text:
+            body_text = f"{lead}\n\n{body_text}" if body_text else lead
 
-        try:
-            data = json.loads(script.string)
-            # Walk the JSON tree looking for article text fields
-            return self._find_article_text_in_json(data)
-        except (json.JSONDecodeError, KeyError):
-            return ""
+        # --- Date ---
+        pub_dt = stub.get("published_at")
+        if not pub_dt:
+            pub_dt = self._extract_date(soup)
 
-    def _extract_from_jsonld(self, soup: BeautifulSoup) -> str:
-        """Extract article text from JSON-LD structured data."""
+        # Date filter
+        if pub_dt:
+            pub_aware = _ensure_tz(pub_dt)
+            if pub_aware > until or pub_aware < since:
+                return None
+
+        if not title and not body_text:
+            return None
+
+        # --- Tags ---
+        tags: list[str] = []
+        for a in soup.select("a[href*='/tag/'], div.tags a"):
+            t = a.get_text(strip=True)
+            if t:
+                tags.append(t)
+
+        # Section from URL
+        m = re.search(r"tass\.ru/([\w-]+)/", url)
+        if m:
+            tags.insert(0, m.group(1))
+
+        return RawArticle(
+            source="tass",
+            title=title or "(без заголовка)",
+            link=url,
+            published_at=pub_dt,
+            raw_text=body_text,
+            native_tags=tags,
+        )
+
+    def _extract_date(self, soup: BeautifulSoup) -> datetime | None:
+        """Extract publication date from article page."""
+        # time[datetime]
+        time_el = soup.find("time", attrs={"datetime": True})
+        if time_el:
+            dt = _parse_datetime(time_el["datetime"])
+            if dt:
+                return dt
+
+        # TASS date selectors
+        for sel in (
+            "span.news-header__date",
+            "div.news-header__date",
+            "span[class*='Date_text']",
+            "span[class*='date']",
+        ):
+            el = soup.select_one(sel)
+            if el and el.get_text(strip=True):
+                dt = _parse_datetime(el.get_text(strip=True))
+                if dt:
+                    return dt
+
+        # meta article:published_time
+        meta = soup.find("meta", attrs={"property": "article:published_time"})
+        if meta:
+            dt = _parse_datetime(meta.get("content", ""))
+            if dt:
+                return dt
+
+        # JSON-LD datePublished
         for script in soup.find_all("script", type="application/ld+json"):
             if not script.string:
                 continue
             try:
                 data = json.loads(script.string)
-                # Handle both single object and array
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    # articleBody is the standard Schema.org field
-                    body = item.get("articleBody", "")
-                    if body and len(body) > 100:
-                        return body
-                    # Try description as fallback
-                    desc = item.get("description", "")
-                    if desc and len(desc) > 200:
-                        return desc
+                if isinstance(data, dict):
+                    for key in ("datePublished", "dateCreated", "dateModified"):
+                        if key in data:
+                            dt = _parse_datetime(data[key])
+                            if dt:
+                                return dt
             except (json.JSONDecodeError, KeyError):
                 continue
-        return ""
 
-    def _extract_from_page_json(self, html: str) -> str:
-        """Try to find article text in inline JSON data in page source."""
-        # Look for patterns like "text":"..." or "body":"..." with substantial content
-        for pattern in (
-            r'"articleBody"\s*:\s*"((?:[^"\\]|\\.){200,})"',
-            r'"text"\s*:\s*"((?:[^"\\]|\\.){200,})"',
-            r'"body"\s*:\s*"((?:[^"\\]|\\.){200,})"',
-            r'"content"\s*:\s*"((?:[^"\\]|\\.){200,})"',
-        ):
-            m = re.search(pattern, html)
-            if m:
-                try:
-                    text = json.loads(f'"{m.group(1)}"')
-                    # Clean HTML if present
-                    if "<" in text:
-                        text = BeautifulSoup(text, "html.parser").get_text(
-                            separator="\n", strip=True
-                        )
-                    if len(text) > 150:
-                        return text
-                except (json.JSONDecodeError, ValueError):
-                    continue
-        return ""
-
-    def _find_article_text_in_json(self, data, depth: int = 0) -> str:
-        """Recursively search JSON for article text fields."""
-        if depth > 10:
-            return ""
-
-        if isinstance(data, dict):
-            # Direct text fields
-            for key in ("articleBody", "text", "body", "content", "textHtml"):
-                val = data.get(key)
-                if isinstance(val, str) and len(val) > 150:
-                    if "<" in val:
-                        val = BeautifulSoup(val, "html.parser").get_text(
-                            separator="\n", strip=True
-                        )
-                    if len(val) > 150:
-                        return val
-
-            # Recurse into child dicts/lists
-            for key, val in data.items():
-                if isinstance(val, (dict, list)):
-                    result = self._find_article_text_in_json(val, depth + 1)
-                    if result:
-                        return result
-
-        elif isinstance(data, list):
-            for item in data:
-                if isinstance(item, (dict, list)):
-                    result = self._find_article_text_in_json(item, depth + 1)
-                    if result:
-                        return result
-
-        return ""
+        return None

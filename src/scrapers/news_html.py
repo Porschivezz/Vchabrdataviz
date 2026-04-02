@@ -291,8 +291,8 @@ class IzvestiaScraper(_BaseNewsHtmlScraper):
 class GazetaScraper(_BaseNewsHtmlScraper):
     """Gazeta.ru — общественно-политическое интернет-издание.
 
-    Gazeta.ru frequently changes URL formats and blocks RSS.
-    Uses HTML listing with broad URL matching + RSS fallback.
+    Gazeta.ru frequently changes URL formats.
+    Uses broad link matching + multiple discovery methods.
     """
 
     source_name = "gazeta"
@@ -309,15 +309,9 @@ class GazetaScraper(_BaseNewsHtmlScraper):
         "https://www.gazeta.ru/sport/",
         "https://www.gazeta.ru/army/",
     ]
-    # Match articles with dates or .shtml or /news/ paths
-    link_pattern = (
-        r"gazeta\.ru/[a-z]+/"
-        r"(?:"
-        r"\d{4}/\d{2}/\d{2}"  # /section/2026/04/02/...
-        r"|news/"              # /section/news/...
-        r"|[a-z0-9_-]+\.shtml" # /section/slug.shtml
-        r")"
-    )
+    # Broad pattern: any path with a section name + deeper path
+    # Excludes root section pages, tag pages, author pages
+    link_pattern = r"gazeta\.ru/[a-z]+/.+"
     article_selectors = [
         "div.article_text_body",
         "div.maintext",
@@ -328,30 +322,69 @@ class GazetaScraper(_BaseNewsHtmlScraper):
         "div.article__text",
     ]
 
-    # Also try RSS as a secondary source
-    _rss_urls = [
-        "https://www.gazeta.ru/export/rss/lenta.xml",
-        "https://www.gazeta.ru/export/rss/first.xml",
-    ]
+    # URLs to exclude (not articles)
+    _exclude_patterns = re.compile(
+        r"(/tag/|/author/|/person/|/spec/|/special/|/rubric/|/about/|/adv/|"
+        r"/\?|#|\.css|\.js|\.png|\.jpg|/rss|/export/|/feed)"
+    )
 
-    def fetch_articles(self, *, since: datetime, until: datetime | None = None) -> list[RawArticle]:
-        # Try HTML scraping first
-        articles = super().fetch_articles(since=since, until=until)
-        if articles:
-            return articles
+    def _fetch_listings(self) -> list[dict]:
+        """Override: use broader link discovery + log findings."""
+        stubs: list[dict] = []
+        seen_links: set[str] = set()
 
-        # Fallback: try RSS
-        logger.info("gazeta: HTML listing gave 0, trying RSS fallback")
-        from src.scrapers.rss_scraper import RssScraper
-        rss = RssScraper(
-            source_name="gazeta",
-            feed_urls=self._rss_urls,
-            fetch_full_page=True,
-            full_text_selector=", ".join(self.article_selectors),
-        )
-        # Copy proxy settings
-        rss.session.proxies = dict(self.session.proxies)
-        return rss.fetch_articles(since=since, until=until)
+        for listing_url in self.listing_urls:
+            try:
+                resp = self.session.get(listing_url, timeout=self.timeout)
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                logger.warning("gazeta: listing %s failed: %s", listing_url, exc)
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            page_found = 0
+
+            for a_tag in soup.find_all("a", href=True):
+                href = a_tag["href"]
+
+                # Build absolute URL
+                if href.startswith("/"):
+                    full_url = f"https://www.gazeta.ru{href}"
+                elif href.startswith("http") and "gazeta.ru" in href:
+                    full_url = href
+                else:
+                    continue
+
+                # Exclude non-article URLs
+                if self._exclude_patterns.search(full_url):
+                    continue
+
+                # Must be deeper than just /section/
+                path = full_url.split("gazeta.ru")[-1]
+                parts = [p for p in path.split("/") if p]
+                if len(parts) < 2:
+                    continue
+
+                if full_url in seen_links:
+                    continue
+                seen_links.add(full_url)
+
+                title = a_tag.get_text(strip=True) or ""
+                if len(title) < 5:
+                    parent = a_tag.parent
+                    if parent:
+                        title = parent.get_text(strip=True)[:200]
+
+                stubs.append({
+                    "title": title[:200] if title else "",
+                    "link": full_url,
+                })
+                page_found += 1
+
+            logger.info("gazeta: found %d links on %s", page_found, listing_url)
+            time.sleep(0.3)
+
+        return stubs
 
 
 # ------------------------------------------------------------------
