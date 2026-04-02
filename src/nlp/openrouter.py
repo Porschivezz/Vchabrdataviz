@@ -15,13 +15,19 @@ from src.nlp.base import AnalysisResult, BaseLLMProvider
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
-You are an expert analyst. Given an article, produce a JSON object with exactly three keys:
+You are an expert analyst. Given an article, produce a JSON object with exactly these keys:
 - "summary": a concise summary (3-5 sentences) in the article's language.
 - "entities": an object with keys "persons", "organizations", "technologies", "weak_signals", \
 each being a list of strings. "weak_signals" are emerging trends or early indicators of change \
-that are not yet mainstream.
+that are not yet mainstream — focus on novel ideas, nascent technologies, regulatory shifts.
+- "relations": a list of relationship triples. Each triple is an object with keys \
+"subject" (str), "predicate" (str — e.g. "инвестирует в", "конкурирует с", "использует", \
+"запускает", "судится с", "приобретает", "партнёрство с"), "object" (str). \
+Extract 2-5 most important relationships from the article.
 - "sentiment": a float from -1.0 (very negative) to 1.0 (very positive), representing \
 the overall tone of the article. 0.0 is neutral.
+- "hype_score": a float from 0.0 to 1.0 — how much hype/excitement the article generates. \
+0.0 is dry factual, 1.0 is maximum hype/controversy.
 Return ONLY valid JSON, no markdown fences."""
 
 
@@ -84,7 +90,9 @@ class OpenRouterProvider(BaseLLMProvider):
 
         summary = parsed.get("summary", "")
         entities = parsed.get("entities", {})
+        relations = parsed.get("relations", [])
         sentiment = parsed.get("sentiment")
+        hype_score = parsed.get("hype_score")
 
         # Clamp sentiment to [-1, 1]
         if sentiment is not None:
@@ -93,13 +101,33 @@ class OpenRouterProvider(BaseLLMProvider):
             except (TypeError, ValueError):
                 sentiment = None
 
+        # Clamp hype_score to [0, 1]
+        if hype_score is not None:
+            try:
+                hype_score = max(0.0, min(1.0, float(hype_score)))
+            except (TypeError, ValueError):
+                hype_score = None
+
+        # Validate relations format
+        valid_relations = []
+        if isinstance(relations, list):
+            for r in relations:
+                if isinstance(r, dict) and all(k in r for k in ("subject", "predicate", "object")):
+                    valid_relations.append({
+                        "subject": str(r["subject"]),
+                        "predicate": str(r["predicate"]),
+                        "object": str(r["object"]),
+                    })
+
         # Now get the embedding
         embedding = self.embed(f"{title}\n{summary}")
 
         return AnalysisResult(
             summary=summary,
             entities=entities,
+            relations=valid_relations,
             sentiment=sentiment,
+            hype_score=hype_score,
             embedding=embedding,
         )
 

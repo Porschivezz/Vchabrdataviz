@@ -47,7 +47,9 @@ class Article(Base):
 
     summary = Column(Text, nullable=True)
     entities = Column(JSONB, nullable=True)
+    relations = Column(JSONB, nullable=True)
     sentiment = Column(Float, nullable=True)
+    hype_score = Column(Float, nullable=True)
     embedding = Column(Vector(settings.embedding_dimensions), nullable=True)
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

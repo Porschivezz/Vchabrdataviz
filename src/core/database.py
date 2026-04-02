@@ -41,9 +41,15 @@ def init_db() -> None:
             f"ALTER COLUMN embedding TYPE vector({dim}) "
             f"USING NULL"
         ))
-        # Add sentiment column if missing
+        # Add new columns if missing
         conn.execute(text(
             "ALTER TABLE articles ADD COLUMN IF NOT EXISTS sentiment FLOAT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE articles ADD COLUMN IF NOT EXISTS hype_score FLOAT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE articles ADD COLUMN IF NOT EXISTS relations JSONB"
         ))
         # Add GIN index for FTS (hybrid search)
         conn.execute(text(

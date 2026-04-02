@@ -102,3 +102,38 @@ def normalize_entities(entities: dict) -> dict:
         result[category] = normalized
 
     return result
+
+
+def normalize_relations(relations: list[dict]) -> list[dict]:
+    """Normalize entity names within relationship triples."""
+    if not relations or not isinstance(relations, list):
+        return relations
+
+    normalized = []
+    for rel in relations:
+        if not isinstance(rel, dict):
+            continue
+        subj = rel.get("subject", "")
+        obj = rel.get("object", "")
+        pred = rel.get("predicate", "")
+
+        # Try to normalize subject and object across all categories
+        for category in ("organizations", "technologies", "persons"):
+            norm_subj = normalize_entity(subj, category)
+            if norm_subj != subj:
+                subj = norm_subj
+                break
+
+        for category in ("organizations", "technologies", "persons"):
+            norm_obj = normalize_entity(obj, category)
+            if norm_obj != obj:
+                obj = norm_obj
+                break
+
+        normalized.append({
+            "subject": subj,
+            "predicate": pred,
+            "object": obj,
+        })
+
+    return normalized
