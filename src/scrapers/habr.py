@@ -1,8 +1,7 @@
-"""Habr.com scraper: kek/v2 API for article listing + full content.
+"""Habr.com scraper: HTML page scraping + kek/v2 API for full content.
 
-Collects ALL publications within the date range by paginating
-through the Habr articles API until 3 consecutive pages are entirely
-older than ``since``.
+Collects ALL publications within the date range by paginating through
+Habr website article listing pages and enriching with kek/v2 API.
 """
 
 from __future__ import annotations
@@ -20,19 +19,17 @@ from src.scrapers.base import BaseScraper, RawArticle
 
 logger = logging.getLogger(__name__)
 
+HABR_ARTICLES_LIST = "https://habr.com/ru/articles/"
 HABR_API_BASE = "https://habr.com/kek/v2"
-HABR_ARTICLES_URL = f"{HABR_API_BASE}/articles/"
 
-# Habr publishes ~500-1500 articles/day. At 20 items/page that's up to 75 pages.
-# Allow up to 500 pages for multi-day ranges.
 MAX_PAGES = 500
-PER_PAGE = 20
 
 
 class HabrScraper(BaseScraper):
     """Fetches ALL articles from Habr within a date range.
 
-    Uses kek/v2 API for both article listing and full body enrichment.
+    Uses website HTML pages for article listing (with pagination)
+    and kek/v2 API for full article body enrichment.
     """
 
     def __init__(self, timeout: int = 30) -> None:
@@ -43,10 +40,9 @@ class HabrScraper(BaseScraper):
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
-            "Accept": "application/json, text/html, */*",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": "https://habr.com/",
-            "Origin": "https://habr.com",
         })
 
     def fetch_articles(
@@ -61,12 +57,19 @@ class HabrScraper(BaseScraper):
         all_stubs: list[dict] = []
         seen_ids: set[str] = set()
         consecutive_old_pages = 0
+        empty_pages = 0
 
         for page in range(1, MAX_PAGES + 1):
-            stubs = self._fetch_api_page(page)
+            stubs = self._fetch_html_page(page)
+
             if not stubs:
-                logger.info("Habr API page %d: empty response, stopping", page)
-                break
+                empty_pages += 1
+                if empty_pages >= 3:
+                    logger.info("Habr: 3 consecutive empty pages, stopping at page %d", page)
+                    break
+                continue
+            else:
+                empty_pages = 0
 
             in_range = 0
             too_old = 0
@@ -108,17 +111,16 @@ class HabrScraper(BaseScraper):
                 )
                 break
 
-            # Progress logging every 10 pages
             if page % 10 == 0:
                 logger.info(
-                    "Habr API page %d: collected %d stubs so far "
+                    "Habr page %d: collected %d stubs so far "
                     "(this page: %d in range, %d old, %d new)",
                     page, len(all_stubs), in_range, too_old, too_new,
                 )
 
-            # Small delay to be polite
+            # Be polite
             if page % 5 == 0:
-                time.sleep(0.3)
+                time.sleep(0.5)
 
         total_pages = min(page, MAX_PAGES)
         logger.info(
@@ -140,29 +142,18 @@ class HabrScraper(BaseScraper):
 
     # ------------------------------------------------------------------
 
-    def _fetch_api_page(self, page: int) -> list[dict]:
-        """Fetch one page of articles from Habr kek/v2 API."""
-        params = {
-            "page": page,
-            "perPage": PER_PAGE,
-            "sort": "date",
-            "fl": "ru",
-            "hl": "ru",
-        }
+    def _fetch_html_page(self, page: int) -> list[dict]:
+        """Fetch one page of the Habr articles listing via HTML scraping."""
+        url = HABR_ARTICLES_LIST if page == 1 else f"{HABR_ARTICLES_LIST}page{page}/"
 
         for attempt in range(3):
             try:
-                resp = self.session.get(
-                    HABR_ARTICLES_URL,
-                    params=params,
-                    timeout=self.timeout,
-                )
+                resp = self.session.get(url, timeout=self.timeout)
                 if resp.status_code == 404:
                     return []
                 if resp.status_code == 429:
-                    # Rate limited — wait and retry
-                    wait = min(2 ** attempt * 2, 30)
-                    logger.warning("Habr API rate limited (429), waiting %ds", wait)
+                    wait = 2 ** attempt * 2
+                    logger.warning("Habr rate limited (429), waiting %ds", wait)
                     time.sleep(wait)
                     continue
                 resp.raise_for_status()
@@ -171,143 +162,109 @@ class HabrScraper(BaseScraper):
                 if attempt < 2:
                     time.sleep(1 + attempt)
                     continue
-                logger.error("Habr API page %d failed: %s", page, exc)
+                logger.error("Habr HTML page %d failed: %s", page, exc)
                 return []
 
-        try:
-            data = resp.json()
-        except Exception as exc:
-            logger.error("Habr API page %d JSON parse error: %s", page, exc)
-            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        items: list[dict] = []
 
-        return self._parse_api_response(data, page)
+        # Find article cards — Habr uses <article> tags with data-id attribute
+        article_els = soup.select("article.tm-articles-list__item")
+        if not article_els:
+            # Fallback: try other selectors
+            article_els = soup.select("article[id^='post-']")
+        if not article_els:
+            article_els = soup.select("article")
 
-    def _parse_api_response(self, data: dict, page: int) -> list[dict]:
-        """Parse the kek/v2/articles response into stub dicts.
+        for el in article_els:
+            stub = self._parse_article_element(el)
+            if stub:
+                items.append(stub)
 
-        The response format can be:
-        1. {"articleIds": [...], "articleRefs": {id: {...}}}
-        2. {"articles": [...]}  (list of article objects)
-        3. {"publicationIds": [...], "publicationRefs": {id: {...}}}
-        """
-        items = []
-
-        # Format 1: articleIds + articleRefs
-        article_ids = data.get("articleIds") or data.get("publicationIds") or []
-        article_refs = data.get("articleRefs") or data.get("publicationRefs") or {}
-
-        if article_ids and article_refs:
-            for aid in article_ids:
-                art = article_refs.get(str(aid))
-                if not art:
-                    continue
-                items.append(self._article_ref_to_stub(art, str(aid)))
-            if items:
-                return items
-
-        # Format 2: articles list
-        articles_list = data.get("articles") or []
-        if isinstance(articles_list, list):
-            for art in articles_list:
-                if isinstance(art, dict):
-                    aid = str(art.get("id", ""))
-                    if aid:
-                        items.append(self._article_ref_to_stub(art, aid))
-            if items:
-                return items
-
-        # Format 3: try to find any list of dicts at top level
-        for key, value in data.items():
-            if isinstance(value, list) and value and isinstance(value[0], dict):
-                for art in value:
-                    aid = str(art.get("id", ""))
-                    if aid:
-                        items.append(self._article_ref_to_stub(art, aid))
-                if items:
-                    return items
-
-        # Log unknown format for debugging
         if page == 1:
-            keys = list(data.keys())[:10]
-            logger.warning(
-                "Habr API page %d: unknown response format. Top keys: %s",
-                page, keys,
-            )
+            logger.info("Habr HTML page 1: found %d article elements", len(items))
 
         return items
 
-    def _article_ref_to_stub(self, art: dict, article_id: str) -> dict:
-        """Convert an article ref object to a stub dict."""
-        # Title
-        title = art.get("titleHtml") or art.get("title") or ""
-        if "<" in title:
-            title = BeautifulSoup(title, "html.parser").get_text(strip=True)
+    def _parse_article_element(self, el) -> dict | None:
+        """Parse a single <article> element into a stub dict."""
+        # Extract article ID from data-id or link
+        article_id = el.get("data-id") or el.get("id", "").replace("post-", "")
 
-        # Link
-        slug = art.get("slug") or art.get("alias") or ""
-        if slug:
-            link = f"https://habr.com/ru/articles/{article_id}/"
+        # Find the title link
+        title_el = (
+            el.select_one("a.tm-title__link")
+            or el.select_one("h2 a")
+            or el.select_one("a.tm-article-snippet__title-link")
+            or el.select_one("a[href*='/articles/']")
+        )
+        if not title_el:
+            return None
+
+        title = title_el.get_text(strip=True)
+        href = title_el.get("href", "")
+
+        # Build full link
+        if href.startswith("/"):
+            link = f"https://habr.com{href}"
+        elif href.startswith("http"):
+            link = href
         else:
-            link = f"https://habr.com/ru/articles/{article_id}/"
+            return None
 
-        # Published date
+        # Extract article ID from link if not found on element
+        if not article_id:
+            m = re.search(r"/articles/(\d+)", link)
+            if m:
+                article_id = m.group(1)
+            else:
+                return None
+
+        link = self._normalize_link(link)
+
+        # Extract datetime
+        time_el = el.select_one("time") or el.select_one("span.tm-article-datetime-published time")
         pub_dt = None
-        time_published = art.get("timePublished") or art.get("publishedAt") or ""
-        if time_published:
-            pub_dt = self._parse_iso(time_published)
+        if time_el:
+            dt_str = time_el.get("datetime", "")
+            if dt_str:
+                pub_dt = self._parse_iso(dt_str)
+            if not pub_dt:
+                title_attr = time_el.get("title", "")
+                if title_attr:
+                    pub_dt = self._parse_iso(title_attr)
 
-        # Tags / hubs
+        # Extract tags/hubs
         tags = []
-        hubs = art.get("hubs") or []
-        if isinstance(hubs, list):
-            for h in hubs:
-                if isinstance(h, dict):
-                    tags.append(h.get("title") or h.get("alias") or "")
-                elif isinstance(h, str):
-                    tags.append(h)
-        flow = art.get("flows") or []
-        if isinstance(flow, list):
-            for f in flow:
-                if isinstance(f, dict):
-                    tags.append(f.get("title") or f.get("alias") or "")
+        for hub_el in el.select("a.tm-publication-hub__link, a[href*='/hub/']"):
+            tag_text = hub_el.get_text(strip=True)
+            if tag_text:
+                tags.append(tag_text)
 
-        tags = [t.strip() for t in tags if t.strip()]
-
-        # Body text (may be available inline)
-        body_html = art.get("textHtml") or art.get("leadData", {}).get("textHtml", "") or ""
-        description = self._html_to_text(body_html) if body_html else ""
+        # Extract snippet/description
+        snippet_el = el.select_one("div.tm-article-body, div.article-formatted-body, .tm-article-snippet__lead")
+        description = snippet_el.get_text(separator="\n", strip=True) if snippet_el else ""
 
         return {
-            "id": article_id,
+            "id": str(article_id),
             "title": title,
-            "link": self._normalize_link(link),
+            "link": link,
             "published_at": pub_dt,
             "description": description,
             "tags": tags,
-            "has_full_text": bool(art.get("textHtml")),
         }
 
     def _enrich_article(self, stub: dict) -> RawArticle | None:
-        """Fetch full article body from kek/v2 API if not already available."""
+        """Fetch full article body from kek/v2 API."""
         article_id = stub["id"]
         raw_text = stub.get("description", "")
 
-        # If we already have full text from listing, skip enrichment
-        if stub.get("has_full_text") and raw_text and len(raw_text) > 200:
-            return RawArticle(
-                source="habr",
-                title=stub["title"],
-                link=stub["link"],
-                published_at=stub["published_at"],
-                raw_text=raw_text,
-                native_tags=stub["tags"],
-            )
-
-        # Fetch full body from API
+        # If we have a good snippet, try to get full text from API
         try:
             resp = self.session.get(
                 f"{HABR_API_BASE}/articles/{article_id}",
                 timeout=self.timeout,
+                headers={"Accept": "application/json"},
             )
             if resp.status_code == 200:
                 data = resp.json()
