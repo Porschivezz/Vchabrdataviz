@@ -1,13 +1,13 @@
 """ТАСС (tass.ru) — dedicated scraper.
 
-TASS RSS feed gives only short descriptions (~80-100 chars).
-This scraper fetches the full article text from each page using
-multiple selector strategies and a smart fallback.
+Uses RSS for article discovery + per-article page fetch for full text.
+Falls back to HTML listing page scraping if RSS fails.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
@@ -19,17 +19,6 @@ from src.scrapers.rss_scraper import _ensure_tz, _parse_datetime, _extract_large
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
-
-# TASS article body selectors (multiple layouts)
-TASS_SELECTORS = [
-    "div.text-block",
-    "div.text-content",
-    "div.news-header__lead",
-    "article.news-text",
-    "div.news-article__text",
-    "div[itemprop='articleBody']",
-    "article",
-]
 
 
 class TassScraper(BaseScraper):
@@ -45,7 +34,6 @@ class TassScraper(BaseScraper):
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
             "Referer": "https://tass.ru/",
         })
         proxy_url = settings.scraper_proxy_url.strip()
@@ -65,7 +53,13 @@ class TassScraper(BaseScraper):
         stubs = self._fetch_rss(since_aware, until_aware)
         logger.info("TASS: %d stubs from RSS", len(stubs))
 
-        # Step 2: Fetch full text for each article
+        # Step 2: If RSS gave nothing, try HTML listing pages
+        if not stubs:
+            logger.info("TASS: RSS empty, trying HTML listing pages")
+            stubs = self._fetch_html_listing(since_aware, until_aware)
+            logger.info("TASS: %d stubs from HTML listing", len(stubs))
+
+        # Step 3: Fetch full text for each article
         articles: list[RawArticle] = []
         for i, stub in enumerate(stubs):
             full_text = self._fetch_article_text(stub["link"])
@@ -85,7 +79,9 @@ class TassScraper(BaseScraper):
 
             if (i + 1) % 20 == 0:
                 logger.info("TASS: enriched %d/%d articles", i + 1, len(stubs))
-                time.sleep(0.3)
+            # Be polite
+            if (i + 1) % 10 == 0:
+                time.sleep(0.5)
 
         full_count = sum(1 for a in articles if len(a.raw_text) > 300)
         logger.info(
@@ -94,9 +90,13 @@ class TassScraper(BaseScraper):
         )
         return articles
 
+    # ------------------------------------------------------------------
+    # RSS fetching
+    # ------------------------------------------------------------------
+
     def _fetch_rss(self, since: datetime, until: datetime) -> list[dict]:
         """Fetch article stubs from TASS RSS feed."""
-        stubs: list[dict] = []
+        resp = None
 
         for attempt in range(3):
             try:
@@ -116,36 +116,40 @@ class TassScraper(BaseScraper):
                 logger.error("TASS RSS failed: %s", exc)
                 return []
 
-        soup = BeautifulSoup(resp.content, "xml")
+        if resp is None or resp.status_code != 200:
+            return []
+
+        # Try html.parser first — more reliable for RSS <link> extraction
+        soup = BeautifulSoup(resp.content, "html.parser")
         items = soup.find_all("item")
+
         if not items:
-            soup = BeautifulSoup(resp.content, "html.parser")
+            # Fallback to XML parser
+            soup = BeautifulSoup(resp.content, "xml")
             items = soup.find_all("item")
 
+        logger.info("TASS RSS: found %d items", len(items))
+        if not items:
+            return []
+
+        stubs: list[dict] = []
         seen_links: set[str] = set()
+
         for item in items:
-            link_el = item.find("link")
-            link = ""
-            if link_el:
-                link = link_el.get_text(strip=True)
-                if not link:
-                    link = link_el.get("href", "")
-            if not link:
-                guid_el = item.find("guid")
-                if guid_el:
-                    g = guid_el.get_text(strip=True)
-                    if g.startswith("http"):
-                        link = g
+            # Extract link — try multiple approaches
+            link = self._extract_link_from_item(item)
             if not link or link in seen_links:
                 continue
 
             pub_dt = None
-            for tag in ("pubDate", "published", "updated"):
-                el = item.find(tag)
+            for tag_name in ("pubDate", "pubdate", "published", "updated"):
+                el = item.find(tag_name)
                 if el:
-                    pub_dt = _parse_datetime(el.get_text(strip=True))
-                    if pub_dt:
-                        break
+                    text = el.get_text(strip=True)
+                    if text:
+                        pub_dt = _parse_datetime(text)
+                        if pub_dt:
+                            break
 
             if pub_dt:
                 pub_aware = _ensure_tz(pub_dt)
@@ -160,12 +164,14 @@ class TassScraper(BaseScraper):
             desc_el = item.find("description")
             description = ""
             if desc_el:
-                desc_text = desc_el.string or desc_el.get_text(strip=True)
-                if desc_text:
-                    if "<" in desc_text:
-                        description = BeautifulSoup(desc_text, "html.parser").get_text(separator="\n", strip=True)
+                desc_raw = desc_el.string or desc_el.get_text(strip=True)
+                if desc_raw:
+                    if "<" in desc_raw:
+                        description = BeautifulSoup(desc_raw, "html.parser").get_text(
+                            separator="\n", strip=True
+                        )
                     else:
-                        description = desc_text.strip()
+                        description = desc_raw.strip()
 
             tags = []
             for cat in item.find_all("category"):
@@ -183,6 +189,91 @@ class TassScraper(BaseScraper):
 
         return stubs
 
+    def _extract_link_from_item(self, item) -> str:
+        """Extract article URL from RSS <item> — handles edge cases."""
+        # Method 1: <link> text content
+        link_el = item.find("link")
+        if link_el:
+            text = link_el.get_text(strip=True)
+            if text and text.startswith("http"):
+                return text
+            # Sometimes link text is in .string or .next_sibling
+            if link_el.string and str(link_el.string).strip().startswith("http"):
+                return str(link_el.string).strip()
+            # BS4 sometimes puts URL as next_sibling NavigableString
+            if link_el.next_sibling:
+                sib = str(link_el.next_sibling).strip()
+                if sib.startswith("http"):
+                    return sib
+            href = link_el.get("href", "")
+            if href:
+                return href.strip()
+
+        # Method 2: <guid> as URL
+        guid_el = item.find("guid")
+        if guid_el:
+            g = guid_el.get_text(strip=True)
+            if g.startswith("http"):
+                return g
+
+        return ""
+
+    # ------------------------------------------------------------------
+    # HTML listing fallback
+    # ------------------------------------------------------------------
+
+    def _fetch_html_listing(self, since: datetime, until: datetime) -> list[dict]:
+        """Scrape TASS homepage/listing pages for article links."""
+        stubs: list[dict] = []
+        seen_links: set[str] = set()
+
+        for section in ("", "/ekonomika", "/politika", "/obschestvo", "/mezhdunarodnaya-panorama"):
+            url = f"https://tass.ru{section}"
+            try:
+                resp = self.session.get(url, timeout=self.timeout)
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                logger.debug("TASS listing %s failed: %s", url, exc)
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Find article links — TASS uses various link patterns
+            for a_tag in soup.find_all("a", href=True):
+                href = a_tag["href"]
+                # TASS article URLs: /section/12345678 or /category/section/12345678
+                if not re.match(r"^/[a-z-]+/\d{5,}$", href) and \
+                   not re.match(r"^/[a-z-]+/[a-z-]+/\d{5,}$", href):
+                    continue
+
+                full_link = f"https://tass.ru{href}"
+                if full_link in seen_links:
+                    continue
+                seen_links.add(full_link)
+
+                title = a_tag.get_text(strip=True) or ""
+                if len(title) < 5:
+                    # Try parent element for title
+                    parent = a_tag.parent
+                    if parent:
+                        title = parent.get_text(strip=True)
+
+                stubs.append({
+                    "title": title[:200] if title else "",
+                    "link": full_link,
+                    "published_at": None,
+                    "description": "",
+                    "tags": [],
+                })
+
+            time.sleep(0.3)
+
+        return stubs
+
+    # ------------------------------------------------------------------
+    # Full text extraction
+    # ------------------------------------------------------------------
+
     def _fetch_article_text(self, url: str) -> str:
         """Fetch full article text from a TASS article page."""
         try:
@@ -198,16 +289,22 @@ class TassScraper(BaseScraper):
         for tag in soup.select("script, style, nav, header, footer, aside, iframe, noscript"):
             tag.decompose()
 
-        # Try TASS-specific selectors
-        for selector in TASS_SELECTORS:
+        # TASS-specific selectors (try in priority order)
+        for selector in (
+            "div.text-block",
+            "div.text-content",
+            "article.news-text",
+            "div.news-article__text",
+            "div[itemprop='articleBody']",
+            "div.ds_content",
+        ):
             el = soup.select_one(selector)
             if el:
                 text = el.get_text(separator="\n", strip=True)
                 if text and len(text) > 150:
                     return text
 
-        # Try collecting all <p> inside the main content area
-        # TASS often has multiple div.text-block elements
+        # Try collecting ALL div.text-block elements (TASS splits content)
         text_blocks = soup.select("div.text-block")
         if text_blocks:
             combined = "\n".join(
@@ -222,11 +319,15 @@ class TassScraper(BaseScraper):
         if text and len(text) > 200:
             return text
 
-        # Last resort: all <p> tags in body
+        # Last resort: all substantial <p> tags in body
         body = soup.find("body")
         if body:
             paragraphs = body.find_all("p")
-            p_text = "\n".join(p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 30)
+            p_text = "\n".join(
+                p.get_text(strip=True)
+                for p in paragraphs
+                if len(p.get_text(strip=True)) > 30
+            )
             if len(p_text) > 200:
                 return p_text
 

@@ -1,16 +1,15 @@
 """Russian news source scrapers — 17 major outlets.
 
-Each class is a thin wrapper around ``RssScraper`` with
-source-specific feed URLs and CSS selectors for full-page
-article text extraction.
-
-TASS uses a dedicated scraper (src/scrapers/tass.py).
+Most use ``RssScraper`` (RSS feed + full-page text extraction).
+TASS, Izvestia, Gazeta.ru, EG use dedicated HTML scrapers because
+their RSS feeds are broken or return insufficient data.
 """
 
 from __future__ import annotations
 
 from src.scrapers.rss_scraper import RssScraper
 from src.scrapers.tass import TassScraper
+from src.scrapers.news_html import IzvestiaScraper, GazetaScraper, EgScraper
 
 
 # ------------------------------------------------------------------ РИА Новости
@@ -101,31 +100,6 @@ class RbcScraper(RssScraper):
             ],
             fetch_full_page=True,
             full_text_selector="div.article__text, div.article__text__overview",
-        )
-
-
-# ------------------------------------------------------------------ Известия
-class IzvestiaScraper(RssScraper):
-    """Известия — федеральная ежедневная газета.
-
-    iz.ru changed their RSS structure multiple times.
-    Try several known RSS paths.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(
-            source_name="izvestia",
-            feed_urls=[
-                "https://iz.ru/xml/rss/all.xml",
-                "https://iz.ru/feed",
-                "https://iz.ru/rss",
-            ],
-            fetch_full_page=True,
-            full_text_selector=(
-                "div.article__text, div.text-article, "
-                "div.article_page__left__article__text, "
-                "div[itemprop='articleBody'], div.article-body"
-            ),
         )
 
 
@@ -222,29 +196,6 @@ class AifScraper(RssScraper):
         )
 
 
-# ------------------------------------------------------------------ Gazeta.ru
-class GazetaScraper(RssScraper):
-    """Gazeta.ru — общественно-политическое интернет-издание.
-
-    gazeta.ru changed RSS paths; try several known URLs.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(
-            source_name="gazeta",
-            feed_urls=[
-                "https://www.gazeta.ru/export/rss/lenta.xml",
-                "https://www.gazeta.ru/export/rss/first.xml",
-                "https://www.gazeta.ru/rss/all.xml",
-            ],
-            fetch_full_page=True,
-            full_text_selector=(
-                "div.article_text_body, div.maintext, "
-                "div[itemprop='articleBody'], div.b-text"
-            ),
-        )
-
-
 # ------------------------------------------------------------------ RT на русском
 class RtScraper(RssScraper):
     """RT (Russia Today) — международное СМИ на русском."""
@@ -272,29 +223,6 @@ class LentaScraper(RssScraper):
             ],
             fetch_full_page=True,
             full_text_selector="div.topic-body__content, div.js-topic__text",
-        )
-
-
-# ------------------------------------------------------------------ Экспресс газета
-class EgScraper(RssScraper):
-    """Экспресс газета — развлекательное издание.
-
-    eg.ru RSS might be at different paths.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(
-            source_name="eg",
-            feed_urls=[
-                "https://www.eg.ru/rss/",
-                "https://eg.ru/feed/",
-                "https://eg.ru/rss",
-            ],
-            fetch_full_page=True,
-            full_text_selector=(
-                "div.article__text, div.post-content, "
-                "div.entry-content, div[itemprop='articleBody']"
-            ),
         )
 
 
