@@ -5,8 +5,11 @@ Usage:
   # Make sure .env has SCRAPER_PROXY_URL set, then:
   docker compose exec app python test_all_sources_vps.py
 
-  # Or run directly (needs deps installed):
+  # Or run directly:
   SCRAPER_PROXY_URL="http://user:pass@host:port" python test_all_sources_vps.py
+
+  # Test a single source:
+  docker compose exec app python test_all_sources_vps.py tass
 """
 
 import sys
@@ -17,12 +20,22 @@ sys.path.insert(0, os.path.dirname(__file__) or ".")
 from datetime import datetime, timedelta, timezone
 from src.scrapers.news_sources import NEWS_SOURCES
 
+# Filter by source name if provided as arg
+filter_name = sys.argv[1] if len(sys.argv) > 1 else None
+
 now = datetime.now(timezone.utc)
 since = now - timedelta(days=2)
 
 results = []
 
-for src_cfg in NEWS_SOURCES:
+sources_to_test = NEWS_SOURCES
+if filter_name:
+    sources_to_test = [s for s in NEWS_SOURCES if s["name"] == filter_name]
+    if not sources_to_test:
+        print(f"Source '{filter_name}' not found. Available: {[s['name'] for s in NEWS_SOURCES]}")
+        sys.exit(1)
+
+for src_cfg in sources_to_test:
     name = src_cfg["name"]
     cls = src_cfg["scraper_class"]
     print(f"\n{'='*70}")
@@ -31,8 +44,12 @@ for src_cfg in NEWS_SOURCES:
 
     try:
         scraper = cls()
-        has_proxy = bool(scraper.session.proxies)
+        has_proxy = bool(getattr(scraper, 'session', None) and scraper.session.proxies)
         print(f"  Proxy: {has_proxy}")
+
+        # Show feed URLs if available
+        if hasattr(scraper, 'feed_urls'):
+            print(f"  Feed URLs: {scraper.feed_urls}")
 
         articles = scraper.fetch_articles(since=since, until=now)
 
@@ -55,6 +72,14 @@ for src_cfg in NEWS_SOURCES:
         print(f"  Sample link: {sample.link}")
         print(f"  Sample text ({len(sample.raw_text)} chars):")
         print(f"    {sample.raw_text[:300]}...")
+
+        # Show short articles for debugging
+        short = [a for a in articles if len(a.raw_text) <= 300]
+        if short:
+            s = short[0]
+            print(f"  Short example: {s.title[:60]} ({len(s.raw_text)} chars)")
+            print(f"    Link: {s.link}")
+            print(f"    Text: {s.raw_text[:200]}")
 
         status = "OK" if full_text_count >= total * 0.5 else "NEEDS_FIX"
         results.append((name, total, full_text_count, avg_len, status))

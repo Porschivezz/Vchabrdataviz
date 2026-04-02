@@ -266,24 +266,42 @@ class RssScraper(BaseScraper):
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Try each selector in the comma-separated list
-            for selector in self.full_text_selector.split(","):
-                selector = selector.strip()
-                el = soup.select_one(selector)
-                if el:
-                    text = el.get_text(separator="\n", strip=True)
-                    if text and len(text) > 100:
-                        return text
+            # Remove noise elements
+            for tag in soup.select("script, style, nav, header, footer, aside, iframe, noscript"):
+                tag.decompose()
 
-            # Fallback: try common article selectors
+            # 1) Try each source-specific selector
+            if self.full_text_selector:
+                for selector in self.full_text_selector.split(","):
+                    selector = selector.strip()
+                    el = soup.select_one(selector)
+                    if el:
+                        text = el.get_text(separator="\n", strip=True)
+                        if text and len(text) > 100:
+                            return text
+
+            # 2) Try common article selectors
             for fallback_sel in (
-                "article",
                 "[itemprop='articleBody']",
+                "article .text-content",
+                "article .article-text",
                 "div.article-body",
                 "div.article__body",
                 "div.article__text",
+                "div.article_text",
+                "div.article-content",
+                "div.news-text",
+                "div.text-block",
+                "div.b-text",
                 "div.post-content",
                 "div.entry-content",
+                "div.story__text",
+                "div.js-mediator-article",
+                "div.styled-text",
+                "div.content-text",
+                "div.topic-body__content",
+                "div.maintext",
+                "article",
                 "main article",
             ):
                 el = soup.select_one(fallback_sel)
@@ -291,6 +309,11 @@ class RssScraper(BaseScraper):
                     text = el.get_text(separator="\n", strip=True)
                     if text and len(text) > 200:
                         return text
+
+            # 3) Smart fallback: find the largest text-dense block
+            text = _extract_largest_text_block(soup)
+            if text and len(text) > 300:
+                return text
 
         except Exception as exc:
             logger.debug("%s: failed to fetch full text from %s: %s", self.source_name, url, exc)
@@ -305,6 +328,38 @@ def _ensure_tz(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _extract_largest_text_block(soup: BeautifulSoup) -> str:
+    """Find the DOM element with the highest density of <p> text content.
+
+    Walks all divs/articles/sections, scores each by total paragraph
+    text length, and returns the best one. This works regardless of
+    CSS class names — catches any article body container.
+    """
+    best_text = ""
+    best_score = 0
+
+    for container in soup.find_all(["div", "article", "section", "main"]):
+        paragraphs = container.find_all("p", recursive=True)
+        if len(paragraphs) < 2:
+            continue
+
+        # Score = total text in <p> tags (penalize containers with too many links)
+        p_text = "\n".join(p.get_text(strip=True) for p in paragraphs)
+        link_text = sum(len(a.get_text()) for a in container.find_all("a", recursive=True))
+        text_len = len(p_text)
+
+        # Penalize navigation-heavy blocks (>50% links)
+        if text_len > 0 and link_text / text_len > 0.5:
+            continue
+
+        # Prefer deeper (more specific) containers with enough text
+        if text_len > best_score and text_len > 200:
+            best_score = text_len
+            best_text = p_text
+
+    return best_text
 
 
 def _html_to_text(html: str) -> str:

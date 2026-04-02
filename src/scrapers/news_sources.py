@@ -1,28 +1,16 @@
 """Russian news source scrapers — 17 major outlets.
 
 Each class is a thin wrapper around ``RssScraper`` with
-source-specific feed URLs and (optionally) a CSS selector
-for full-page article text extraction.
+source-specific feed URLs and CSS selectors for full-page
+article text extraction.
+
+TASS uses a dedicated scraper (src/scrapers/tass.py).
 """
 
 from __future__ import annotations
 
 from src.scrapers.rss_scraper import RssScraper
-
-
-# ------------------------------------------------------------------ ТАСС
-class TassScraper(RssScraper):
-    """ТАСС — главное государственное информационное агентство."""
-
-    def __init__(self) -> None:
-        super().__init__(
-            source_name="tass",
-            feed_urls=[
-                "https://tass.ru/rss/v2.xml",
-            ],
-            fetch_full_page=True,
-            full_text_selector="article.news-text, div.text-content, div.news-article__text",
-        )
+from src.scrapers.tass import TassScraper
 
 
 # ------------------------------------------------------------------ РИА Новости
@@ -118,22 +106,35 @@ class RbcScraper(RssScraper):
 
 # ------------------------------------------------------------------ Известия
 class IzvestiaScraper(RssScraper):
-    """Известия — федеральная ежедневная газета."""
+    """Известия — федеральная ежедневная газета.
+
+    iz.ru changed their RSS structure multiple times.
+    Try several known RSS paths.
+    """
 
     def __init__(self) -> None:
         super().__init__(
             source_name="izvestia",
             feed_urls=[
                 "https://iz.ru/xml/rss/all.xml",
+                "https://iz.ru/feed",
+                "https://iz.ru/rss",
             ],
             fetch_full_page=True,
-            full_text_selector="div.article_page__left__article__text, div.text-article",
+            full_text_selector=(
+                "div.article__text, div.text-article, "
+                "div.article_page__left__article__text, "
+                "div[itemprop='articleBody'], div.article-body"
+            ),
         )
 
 
 # ------------------------------------------------------------------ Российская газета
 class RgScraper(RssScraper):
-    """Российская газета — официальное издание правительства РФ."""
+    """Российская газета — официальное издание правительства РФ.
+
+    RG has multiple page templates; need broad selector coverage.
+    """
 
     def __init__(self) -> None:
         super().__init__(
@@ -142,7 +143,11 @@ class RgScraper(RssScraper):
                 "https://rg.ru/xml/index.xml",
             ],
             fetch_full_page=True,
-            full_text_selector="div.article-body, div.PageArticleContent_article",
+            full_text_selector=(
+                "div.PageArticleContent_text, div.PageArticleContent_article, "
+                "div.article-body, div.b-material-wrapper__text, "
+                "div[itemprop='articleBody'], div.article__text"
+            ),
         )
 
 
@@ -157,13 +162,20 @@ class NgScraper(RssScraper):
                 "https://www.ng.ru/rss/",
             ],
             fetch_full_page=True,
-            full_text_selector="div.article_text, div.content-text",
+            full_text_selector=(
+                "div.detail_text, div.article_text, div.content-text, "
+                "div[itemprop='articleBody'], div.b-text, "
+                "div.news-text, article.article-body"
+            ),
         )
 
 
 # ------------------------------------------------------------------ Комсомольская правда
 class KpScraper(RssScraper):
-    """Комсомольская правда — массовое ежедневное издание."""
+    """Комсомольская правда — массовое ежедневное издание.
+
+    KP uses 'Mediator' content platform with dynamic loading.
+    """
 
     def __init__(self) -> None:
         super().__init__(
@@ -172,7 +184,11 @@ class KpScraper(RssScraper):
                 "https://www.kp.ru/rss/allsections.xml",
             ],
             fetch_full_page=True,
-            full_text_selector="div.article-content, div.styled-text, div.js-mediator-article",
+            full_text_selector=(
+                "div.js-mediator-article, div[itemprop='articleBody'], "
+                "div.styled-text, div.article-content, "
+                "div.text-content, div.post__text"
+            ),
         )
 
 
@@ -208,7 +224,10 @@ class AifScraper(RssScraper):
 
 # ------------------------------------------------------------------ Gazeta.ru
 class GazetaScraper(RssScraper):
-    """Gazeta.ru — общественно-политическое интернет-издание."""
+    """Gazeta.ru — общественно-политическое интернет-издание.
+
+    gazeta.ru changed RSS paths; try several known URLs.
+    """
 
     def __init__(self) -> None:
         super().__init__(
@@ -216,9 +235,13 @@ class GazetaScraper(RssScraper):
             feed_urls=[
                 "https://www.gazeta.ru/export/rss/lenta.xml",
                 "https://www.gazeta.ru/export/rss/first.xml",
+                "https://www.gazeta.ru/rss/all.xml",
             ],
             fetch_full_page=True,
-            full_text_selector="div.article_text_body, div.maintext",
+            full_text_selector=(
+                "div.article_text_body, div.maintext, "
+                "div[itemprop='articleBody'], div.b-text"
+            ),
         )
 
 
@@ -254,16 +277,24 @@ class LentaScraper(RssScraper):
 
 # ------------------------------------------------------------------ Экспресс газета
 class EgScraper(RssScraper):
-    """Экспресс газета — развлекательное издание."""
+    """Экспресс газета — развлекательное издание.
+
+    eg.ru RSS might be at different paths.
+    """
 
     def __init__(self) -> None:
         super().__init__(
             source_name="eg",
             feed_urls=[
                 "https://www.eg.ru/rss/",
+                "https://eg.ru/feed/",
+                "https://eg.ru/rss",
             ],
             fetch_full_page=True,
-            full_text_selector="div.article__text, div.post-content, div.entry-content",
+            full_text_selector=(
+                "div.article__text, div.post-content, "
+                "div.entry-content, div[itemprop='articleBody']"
+            ),
         )
 
 
