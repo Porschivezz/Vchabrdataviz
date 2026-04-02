@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
+    # --- Proxy (for scraping Russian sites behind geo-filters) ---
+    scraper_proxy_url: str = ""
+
     # --- Admin ---
     admin_password: str = "changeme123"
 

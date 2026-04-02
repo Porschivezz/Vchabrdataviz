@@ -16,6 +16,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from src.scrapers.base import BaseScraper, RawArticle
+from src.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,9 @@ class TelegramChannelScraper(BaseScraper):
             "Accept": "text/html,application/xhtml+xml,*/*",
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         })
+        proxy_url = settings.scraper_proxy_url.strip()
+        if proxy_url:
+            self.session.proxies.update({"http": proxy_url, "https": proxy_url})
 
     def fetch_articles(
         self,
