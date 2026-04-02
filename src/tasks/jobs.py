@@ -12,8 +12,15 @@ logger = logging.getLogger(__name__)
 
 @app.task(name="src.tasks.jobs.poll_all_sources", bind=True, max_retries=2)
 def poll_all_sources(self) -> dict:
-    """Poll all enabled sources for recent articles (last 2 hours)."""
+    """Poll all enabled sources for recent articles (last 2 hours).
+
+    Reloads source registry from DB to pick up new Telegram channels.
+    """
+    from src.scrapers.registry import reload_all_sources
     from src.services.ingestion_service import ingest_all
+
+    # Reload to pick up any new Telegram channels added via admin
+    reload_all_sources()
 
     now = datetime.now(timezone.utc)
     since = now - timedelta(hours=2)
@@ -30,7 +37,10 @@ def poll_all_sources(self) -> dict:
 @app.task(name="src.tasks.jobs.ingest_source", bind=True, max_retries=2)
 def ingest_source(self, source_name: str, since_iso: str, until_iso: str) -> dict:
     """Ingest a specific source for a date range."""
+    from src.scrapers.registry import reload_all_sources
     from src.services.ingestion_service import ingest_all
+
+    reload_all_sources()
 
     since = datetime.fromisoformat(since_iso)
     until = datetime.fromisoformat(until_iso)
@@ -45,7 +55,10 @@ def ingest_source(self, source_name: str, since_iso: str, until_iso: str) -> dic
 @app.task(name="src.tasks.jobs.ingest_all_sources", bind=True, max_retries=2)
 def ingest_all_sources(self, since_iso: str, until_iso: str) -> dict:
     """Ingest all enabled sources for a date range."""
+    from src.scrapers.registry import reload_all_sources
     from src.services.ingestion_service import ingest_all
+
+    reload_all_sources()
 
     since = datetime.fromisoformat(since_iso)
     until = datetime.fromisoformat(until_iso)

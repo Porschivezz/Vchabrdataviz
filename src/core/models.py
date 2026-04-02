@@ -7,6 +7,7 @@ from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     Float,
@@ -47,7 +48,9 @@ class Article(Base):
 
     summary = Column(Text, nullable=True)
     entities = Column(JSONB, nullable=True)
+    relations = Column(JSONB, nullable=True)
     sentiment = Column(Float, nullable=True)
+    hype_score = Column(Float, nullable=True)
     embedding = Column(Vector(settings.embedding_dimensions), nullable=True)
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -90,3 +93,21 @@ class DailyDigest(Base):
     avg_sentiment = Column(Float, nullable=True)
     article_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class TelegramChannel(Base):
+    """Telegram channels configured for scraping."""
+    __tablename__ = "telegram_channels"
+    __table_args__ = (UniqueConstraint("username", name="uq_tg_channel_username"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username = Column(String(128), nullable=False, unique=True)  # e.g. "russicaRU"
+    title = Column(Text, nullable=True)  # display name, fetched on add
+    enabled = Column(Boolean, nullable=False, default=True)
+    last_message_id = Column(Integer, nullable=True)  # track last fetched msg
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_fetched_at = Column(DateTime, nullable=True)
+    post_count = Column(Integer, nullable=False, default=0)
+
+    def __repr__(self) -> str:
+        return f"<TelegramChannel @{self.username}>"

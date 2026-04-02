@@ -1,7 +1,7 @@
-"""Habr.com scraper: RSS pagination by date range + kek/v2 API for full content.
+"""Habr.com scraper: HTML page scraping + kek/v2 API for full content.
 
-Collects ALL publications within the date range by paginating
-through RSS pages until 3 consecutive pages are entirely older than ``since``.
+Collects ALL publications within the date range by paginating through
+Habr website article listing pages and enriching with kek/v2 API.
 """
 
 from __future__ import annotations
@@ -9,31 +9,28 @@ from __future__ import annotations
 import logging
 import re
 import time
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-from urllib.parse import urlparse, urlunparse, urlencode, parse_qs
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 import requests
 from bs4 import BeautifulSoup
 
 from src.scrapers.base import BaseScraper, RawArticle
+from src.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-HABR_RSS = "https://habr.com/ru/rss/all/all/"
+HABR_ARTICLES_LIST = "https://habr.com/ru/articles/"
 HABR_API_BASE = "https://habr.com/kek/v2"
 
-# Habr RSS: ~40 items/page. For a full day with ~500-1000 articles,
-# need ~25-50 pages. Allow up to 500 pages for multi-day ranges.
 MAX_PAGES = 500
 
 
 class HabrScraper(BaseScraper):
     """Fetches ALL articles from Habr within a date range.
 
-    Uses RSS for article listing (with pagination) and kek/v2 API
-    for full article body enrichment.
+    Uses website HTML pages for article listing (with pagination)
+    and kek/v2 API for full article body enrichment.
     """
 
     def __init__(self, timeout: int = 30) -> None:
@@ -44,11 +41,13 @@ class HabrScraper(BaseScraper):
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
-            "Accept": "application/json, text/html, */*",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": "https://habr.com/",
-            "Origin": "https://habr.com",
         })
+        proxy_url = settings.scraper_proxy_url.strip()
+        if proxy_url:
+            self.session.proxies.update({"http": proxy_url, "https": proxy_url})
 
     def fetch_articles(
         self,
@@ -60,23 +59,31 @@ class HabrScraper(BaseScraper):
         until_aware = self._ensure_tz(until) if until else datetime.now(timezone.utc)
 
         all_stubs: list[dict] = []
-        seen_links: set[str] = set()
+        seen_ids: set[str] = set()
         consecutive_old_pages = 0
+        empty_pages = 0
 
         for page in range(1, MAX_PAGES + 1):
-            stubs = self._fetch_rss_page(page)
+            stubs = self._fetch_html_page(page)
+
             if not stubs:
-                break
+                empty_pages += 1
+                if empty_pages >= 3:
+                    logger.info("Habr: 3 consecutive empty pages, stopping at page %d", page)
+                    break
+                continue
+            else:
+                empty_pages = 0
 
             in_range = 0
             too_old = 0
             too_new = 0
 
             for stub in stubs:
-                link = stub["link"]
-                if link in seen_links:
+                art_id = stub["id"]
+                if art_id in seen_ids:
                     continue
-                seen_links.add(link)
+                seen_ids.add(art_id)
 
                 pub = stub.get("published_at")
                 if pub is None:
@@ -96,7 +103,7 @@ class HabrScraper(BaseScraper):
                 all_stubs.append(stub)
                 in_range += 1
 
-            # Track consecutive all-old pages (require 3 to confirm boundary)
+            # Track consecutive all-old pages
             if too_old > 0 and in_range == 0 and too_new == 0:
                 consecutive_old_pages += 1
             else:
@@ -108,23 +115,27 @@ class HabrScraper(BaseScraper):
                 )
                 break
 
-            # Progress logging every 10 pages
             if page % 10 == 0:
                 logger.info(
-                    "Habr RSS page %d: collected %d stubs so far "
+                    "Habr page %d: collected %d stubs so far "
                     "(this page: %d in range, %d old, %d new)",
                     page, len(all_stubs), in_range, too_old, too_new,
                 )
 
+            # Be polite
+            if page % 5 == 0:
+                time.sleep(0.5)
+
+        total_pages = min(page, MAX_PAGES)
         logger.info(
             "Habr: collected %d stubs in range %s – %s (pages scanned: %d)",
-            len(all_stubs), since_aware.date(), until_aware.date(), page,
+            len(all_stubs), since_aware.date(), until_aware.date(), total_pages,
         )
 
         # Enrich stubs with full body via API
         articles: list[RawArticle] = []
         for i, stub in enumerate(all_stubs):
-            article = self._enrich_with_api(stub)
+            article = self._enrich_article(stub)
             if article is not None:
                 articles.append(article)
             if (i + 1) % 100 == 0:
@@ -135,69 +146,129 @@ class HabrScraper(BaseScraper):
 
     # ------------------------------------------------------------------
 
-    def _fetch_rss_page(self, page: int) -> list[dict]:
-        """Fetch one page of Habr RSS."""
-        url = HABR_RSS if page == 1 else f"{HABR_RSS}page{page}/"
+    def _fetch_html_page(self, page: int) -> list[dict]:
+        """Fetch one page of the Habr articles listing via HTML scraping."""
+        url = HABR_ARTICLES_LIST if page == 1 else f"{HABR_ARTICLES_LIST}page{page}/"
 
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 resp = self.session.get(url, timeout=self.timeout)
                 if resp.status_code == 404:
                     return []
+                if resp.status_code == 429:
+                    wait = 2 ** attempt * 2
+                    logger.warning("Habr rate limited (429), waiting %ds", wait)
+                    time.sleep(wait)
+                    continue
                 resp.raise_for_status()
                 break
             except requests.RequestException as exc:
-                if attempt == 0:
-                    time.sleep(1)
+                if attempt < 2:
+                    time.sleep(1 + attempt)
                     continue
-                logger.error("Habr RSS page %d failed: %s", page, exc)
+                logger.error("Habr HTML page %d failed: %s", page, exc)
                 return []
 
-        try:
-            root = ET.fromstring(resp.content)
-        except ET.ParseError as exc:
-            logger.error("Habr RSS parse error (page %d): %s", page, exc)
-            return []
-
+        soup = BeautifulSoup(resp.text, "html.parser")
         items: list[dict] = []
-        for item_el in root.findall(".//item"):
-            link = self._normalize_link((item_el.findtext("link") or "").strip())
-            title = (item_el.findtext("title") or "").strip()
-            pub_str = (item_el.findtext("pubDate") or "").strip()
-            description = (item_el.findtext("description") or "").strip()
 
-            article_id = self._extract_id(link)
-            if not article_id:
-                continue
+        # Find article cards — Habr uses <article> tags with data-id attribute
+        article_els = soup.select("article.tm-articles-list__item")
+        if not article_els:
+            # Fallback: try other selectors
+            article_els = soup.select("article[id^='post-']")
+        if not article_els:
+            article_els = soup.select("article")
 
-            tags = [
-                c.text.strip()
-                for c in item_el.findall("category")
-                if c.text and c.text.strip()
-            ]
+        for el in article_els:
+            stub = self._parse_article_element(el)
+            if stub:
+                items.append(stub)
 
-            pub_dt = self._parse_rfc2822(pub_str)
-
-            items.append({
-                "id": article_id,
-                "title": title,
-                "link": link,
-                "published_at": pub_dt,
-                "description": description,
-                "tags": tags,
-            })
+        if page == 1:
+            logger.info("Habr HTML page 1: found %d article elements", len(items))
 
         return items
 
-    def _enrich_with_api(self, stub: dict) -> RawArticle | None:
+    def _parse_article_element(self, el) -> dict | None:
+        """Parse a single <article> element into a stub dict."""
+        # Extract article ID from data-id or link
+        article_id = el.get("data-id") or el.get("id", "").replace("post-", "")
+
+        # Find the title link
+        title_el = (
+            el.select_one("a.tm-title__link")
+            or el.select_one("h2 a")
+            or el.select_one("a.tm-article-snippet__title-link")
+            or el.select_one("a[href*='/articles/']")
+        )
+        if not title_el:
+            return None
+
+        title = title_el.get_text(strip=True)
+        href = title_el.get("href", "")
+
+        # Build full link
+        if href.startswith("/"):
+            link = f"https://habr.com{href}"
+        elif href.startswith("http"):
+            link = href
+        else:
+            return None
+
+        # Extract article ID from link if not found on element
+        if not article_id:
+            m = re.search(r"/articles/(\d+)", link)
+            if m:
+                article_id = m.group(1)
+            else:
+                return None
+
+        link = self._normalize_link(link)
+
+        # Extract datetime
+        time_el = el.select_one("time") or el.select_one("span.tm-article-datetime-published time")
+        pub_dt = None
+        if time_el:
+            dt_str = time_el.get("datetime", "")
+            if dt_str:
+                pub_dt = self._parse_iso(dt_str)
+            if not pub_dt:
+                title_attr = time_el.get("title", "")
+                if title_attr:
+                    pub_dt = self._parse_iso(title_attr)
+
+        # Extract tags/hubs
+        tags = []
+        for hub_el in el.select("a.tm-publication-hub__link, a[href*='/hub/']"):
+            tag_text = hub_el.get_text(strip=True)
+            if tag_text:
+                tags.append(tag_text)
+
+        # Extract snippet/description
+        snippet_el = el.select_one("div.tm-article-body, div.article-formatted-body, .tm-article-snippet__lead")
+        description = snippet_el.get_text(separator="\n", strip=True) if snippet_el else ""
+
+        return {
+            "id": str(article_id),
+            "title": title,
+            "link": link,
+            "published_at": pub_dt,
+            "description": description,
+            "tags": tags,
+        }
+
+    def _enrich_article(self, stub: dict) -> RawArticle | None:
         """Fetch full article body from kek/v2 API."""
         article_id = stub["id"]
-        raw_text = ""
+        raw_text = stub.get("description", "")
 
+        # If we have a good snippet, try to get full text from API
         try:
             resp = self.session.get(
                 f"{HABR_API_BASE}/articles/{article_id}",
                 timeout=self.timeout,
+                headers={"Accept": "application/json"},
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -206,12 +277,10 @@ class HabrScraper(BaseScraper):
                     or data.get("article", {}).get("textHtml")
                     or ""
                 )
-                raw_text = self._html_to_text(body_html)
+                if body_html:
+                    raw_text = self._html_to_text(body_html)
         except Exception as exc:
             logger.debug("Habr kek API failed for %s: %s", article_id, exc)
-
-        if not raw_text:
-            raw_text = self._html_to_text(stub.get("description", ""))
 
         if not raw_text and not stub["title"]:
             return None
@@ -245,11 +314,6 @@ class HabrScraper(BaseScraper):
         return urlunparse(parsed._replace(query=clean_query))
 
     @staticmethod
-    def _extract_id(link: str) -> str | None:
-        m = re.search(r"/articles/(\d+)", link)
-        return m.group(1) if m else None
-
-    @staticmethod
     def _html_to_text(html: str) -> str:
         if not html:
             return ""
@@ -257,13 +321,13 @@ class HabrScraper(BaseScraper):
         return soup.get_text(separator="\n", strip=True)
 
     @staticmethod
-    def _parse_rfc2822(s: str) -> datetime | None:
+    def _parse_iso(s: str) -> datetime | None:
         if not s:
             return None
         try:
-            return parsedate_to_datetime(s)
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
         except Exception:
-            try:
-                return datetime.fromisoformat(s)
-            except Exception:
-                return None
+            return None
