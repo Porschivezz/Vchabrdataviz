@@ -15,7 +15,6 @@ import requests
 from bs4 import BeautifulSoup
 
 from src.scrapers.base import BaseScraper, RawArticle
-from src.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +43,6 @@ class VcScraper(BaseScraper):
             "Accept": "application/json",
             "Referer": "https://vc.ru/",
         })
-        proxy_url = settings.scraper_proxy_url.strip()
-        if proxy_url:
-            self.session.proxies.update({"http": proxy_url, "https": proxy_url})
 
     def fetch_articles(
         self,

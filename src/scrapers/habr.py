@@ -16,7 +16,6 @@ import requests
 from bs4 import BeautifulSoup
 
 from src.scrapers.base import BaseScraper, RawArticle
-from src.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +44,6 @@ class HabrScraper(BaseScraper):
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": "https://habr.com/",
         })
-        proxy_url = settings.scraper_proxy_url.strip()
-        if proxy_url:
-            self.session.proxies.update({"http": proxy_url, "https": proxy_url})
 
     def fetch_articles(
         self,
