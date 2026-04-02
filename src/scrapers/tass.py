@@ -51,22 +51,49 @@ def _is_article_url(href: str) -> bool:
 
 
 class TassScraper(BaseScraper):
-    """ТАСС — парсер на основе рабочего продакшн-парсера."""
+    """ТАСС — парсер на основе рабочего продакшн-парсера.
+
+    TASS's DDoS-Guard blocks many proxy IPs. We use two sessions:
+    - direct session (no proxy) for RSS discovery + article fetches
+    - proxy session as fallback if direct access fails
+    """
 
     def __init__(self, timeout: int = 30) -> None:
         self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update({
+        headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        })
+        }
+
+        # Direct session (no proxy) — preferred for TASS
+        self.session = requests.Session()
+        self.session.headers.update(headers)
+
+        # Proxy session as fallback
+        self._proxy_session: requests.Session | None = None
         proxy_url = settings.scraper_proxy_url.strip()
         if proxy_url:
-            self.session.proxies.update({"http": proxy_url, "https": proxy_url})
+            self._proxy_session = requests.Session()
+            self._proxy_session.headers.update(headers)
+            self._proxy_session.proxies.update({"http": proxy_url, "https": proxy_url})
+
+    def _get(self, url: str, **kwargs) -> requests.Response:
+        """GET with fallback: try direct first, then proxy."""
+        kwargs.setdefault("timeout", self.timeout)
+        try:
+            resp = self.session.get(url, **kwargs)
+            if resp.status_code == 403 and self._proxy_session:
+                logger.debug("TASS: direct 403 for %s, trying proxy", url)
+                resp = self._proxy_session.get(url, **kwargs)
+            return resp
+        except requests.RequestException:
+            if self._proxy_session:
+                return self._proxy_session.get(url, **kwargs)
+            raise
 
     def fetch_articles(
         self,
@@ -114,7 +141,7 @@ class TassScraper(BaseScraper):
 
         for feed_url in RSS_FEEDS:
             try:
-                resp = self.session.get(feed_url, timeout=self.timeout)
+                resp = self._get(feed_url)
                 resp.raise_for_status()
             except requests.RequestException as exc:
                 logger.debug("TASS RSS %s failed: %s", feed_url, exc)
@@ -187,7 +214,7 @@ class TassScraper(BaseScraper):
         for section in sections:
             url = f"{TASS_HOME}{section}"
             try:
-                resp = self.session.get(url, timeout=self.timeout)
+                resp = self._get(url)
                 resp.raise_for_status()
             except requests.RequestException:
                 continue
@@ -217,11 +244,23 @@ class TassScraper(BaseScraper):
         url = stub["link"]
 
         try:
-            resp = self.session.get(url, timeout=self.timeout)
+            resp = self._get(url)
             resp.raise_for_status()
         except requests.RequestException as exc:
             logger.debug("TASS article %s failed: %s", url, exc)
             return None
+
+        # If page is too small (JS shell / SPA), retry with Googlebot UA
+        if len(resp.text) < 5000:
+            try:
+                resp2 = self.session.get(
+                    url, timeout=self.timeout,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"},
+                )
+                if resp2.status_code == 200 and len(resp2.text) > len(resp.text):
+                    resp = resp2
+            except requests.RequestException:
+                pass
 
         soup = BeautifulSoup(resp.text, "html.parser")
 

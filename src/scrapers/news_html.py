@@ -291,8 +291,8 @@ class IzvestiaScraper(_BaseNewsHtmlScraper):
 class GazetaScraper(_BaseNewsHtmlScraper):
     """Gazeta.ru — общественно-политическое интернет-издание.
 
-    Gazeta.ru frequently changes URL formats.
-    Uses broad link matching + multiple discovery methods.
+    Gazeta.ru uses JS anti-bot challenge for regular browsers but serves
+    full SSR content to search engine crawlers (Googlebot UA).
     """
 
     source_name = "gazeta"
@@ -321,6 +321,14 @@ class GazetaScraper(_BaseNewsHtmlScraper):
         "div.item_text",
         "div.article__text",
     ]
+
+    def __init__(self, timeout: int = 30) -> None:
+        super().__init__(timeout=timeout)
+        # Gazeta.ru serves full SSR content to Googlebot but JS shell to browsers
+        self.session.headers["User-Agent"] = (
+            "Mozilla/5.0 (compatible; Googlebot/2.1; "
+            "+http://www.google.com/bot.html)"
+        )
 
     # URLs to exclude (not articles)
     _exclude_patterns = re.compile(
