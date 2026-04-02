@@ -45,3 +45,6 @@ app.conf.beat_schedule = {
 
 # Autodiscover tasks
 app.autodiscover_tasks(["src.tasks"])
+
+# Explicitly import tasks module so Celery registers all task functions
+import src.tasks.jobs  # noqa: F401
