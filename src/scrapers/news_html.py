@@ -94,6 +94,7 @@ class _BaseNewsHtmlScraper(BaseScraper):
                 continue
 
             soup = BeautifulSoup(resp.text, "html.parser")
+            page_found = 0
 
             for a_tag in soup.find_all("a", href=True):
                 href = a_tag["href"]
@@ -124,7 +125,9 @@ class _BaseNewsHtmlScraper(BaseScraper):
                     "title": title[:200] if title else "",
                     "link": full_url,
                 })
+                page_found += 1
 
+            logger.debug("%s: found %d links on %s", self.source_name, page_found, listing_url)
             time.sleep(0.3)
 
         return stubs
@@ -286,27 +289,69 @@ class IzvestiaScraper(_BaseNewsHtmlScraper):
 # ------------------------------------------------------------------
 
 class GazetaScraper(_BaseNewsHtmlScraper):
-    """Gazeta.ru — общественно-политическое интернет-издание."""
+    """Gazeta.ru — общественно-политическое интернет-издание.
+
+    Gazeta.ru frequently changes URL formats and blocks RSS.
+    Uses HTML listing with broad URL matching + RSS fallback.
+    """
 
     source_name = "gazeta"
     base_url = "https://www.gazeta.ru"
     listing_urls = [
         "https://www.gazeta.ru/",
+        "https://www.gazeta.ru/last.shtml",
         "https://www.gazeta.ru/politics/",
         "https://www.gazeta.ru/business/",
         "https://www.gazeta.ru/social/",
         "https://www.gazeta.ru/tech/",
         "https://www.gazeta.ru/science/",
+        "https://www.gazeta.ru/culture/",
+        "https://www.gazeta.ru/sport/",
+        "https://www.gazeta.ru/army/",
     ]
-    # gazeta.ru articles: /section/year/month/day/article_slug.shtml
-    link_pattern = r"gazeta\.ru/[a-z]+/\d{4}/\d{2}/\d{2}/.*\.shtml"
+    # Match articles with dates or .shtml or /news/ paths
+    link_pattern = (
+        r"gazeta\.ru/[a-z]+/"
+        r"(?:"
+        r"\d{4}/\d{2}/\d{2}"  # /section/2026/04/02/...
+        r"|news/"              # /section/news/...
+        r"|[a-z0-9_-]+\.shtml" # /section/slug.shtml
+        r")"
+    )
     article_selectors = [
         "div.article_text_body",
         "div.maintext",
         "div[itemprop='articleBody']",
         "div.b-text",
         "div.article-text",
+        "div.item_text",
+        "div.article__text",
     ]
+
+    # Also try RSS as a secondary source
+    _rss_urls = [
+        "https://www.gazeta.ru/export/rss/lenta.xml",
+        "https://www.gazeta.ru/export/rss/first.xml",
+    ]
+
+    def fetch_articles(self, *, since: datetime, until: datetime | None = None) -> list[RawArticle]:
+        # Try HTML scraping first
+        articles = super().fetch_articles(since=since, until=until)
+        if articles:
+            return articles
+
+        # Fallback: try RSS
+        logger.info("gazeta: HTML listing gave 0, trying RSS fallback")
+        from src.scrapers.rss_scraper import RssScraper
+        rss = RssScraper(
+            source_name="gazeta",
+            feed_urls=self._rss_urls,
+            fetch_full_page=True,
+            full_text_selector=", ".join(self.article_selectors),
+        )
+        # Copy proxy settings
+        rss.session.proxies = dict(self.session.proxies)
+        return rss.fetch_articles(since=since, until=until)
 
 
 # ------------------------------------------------------------------

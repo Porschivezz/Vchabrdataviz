@@ -1,11 +1,13 @@
 """ТАСС (tass.ru) — dedicated scraper.
 
-Uses RSS for article discovery + per-article page fetch for full text.
-Falls back to HTML listing page scraping if RSS fails.
+TASS uses Next.js with server-side rendering. Article text is embedded
+in <script id="__NEXT_DATA__"> as JSON and also in JSON-LD.
+This scraper extracts text from those sources when CSS selectors fail.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -79,7 +81,6 @@ class TassScraper(BaseScraper):
 
             if (i + 1) % 20 == 0:
                 logger.info("TASS: enriched %d/%d articles", i + 1, len(stubs))
-            # Be polite
             if (i + 1) % 10 == 0:
                 time.sleep(0.5)
 
@@ -96,8 +97,11 @@ class TassScraper(BaseScraper):
 
     def _fetch_rss(self, since: datetime, until: datetime) -> list[dict]:
         """Fetch article stubs from TASS RSS feed."""
-        resp = None
+        import warnings
+        from bs4 import XMLParsedAsHTMLWarning
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
+        resp = None
         for attempt in range(3):
             try:
                 resp = self.session.get(
@@ -119,12 +123,11 @@ class TassScraper(BaseScraper):
         if resp is None or resp.status_code != 200:
             return []
 
-        # Try html.parser first — more reliable for RSS <link> extraction
+        # Use html.parser for reliable <link> text extraction from RSS
         soup = BeautifulSoup(resp.content, "html.parser")
         items = soup.find_all("item")
 
         if not items:
-            # Fallback to XML parser
             soup = BeautifulSoup(resp.content, "xml")
             items = soup.find_all("item")
 
@@ -136,7 +139,6 @@ class TassScraper(BaseScraper):
         seen_links: set[str] = set()
 
         for item in items:
-            # Extract link — try multiple approaches
             link = self._extract_link_from_item(item)
             if not link or link in seen_links:
                 continue
@@ -190,17 +192,14 @@ class TassScraper(BaseScraper):
         return stubs
 
     def _extract_link_from_item(self, item) -> str:
-        """Extract article URL from RSS <item> — handles edge cases."""
-        # Method 1: <link> text content
+        """Extract article URL from RSS <item>."""
         link_el = item.find("link")
         if link_el:
             text = link_el.get_text(strip=True)
             if text and text.startswith("http"):
                 return text
-            # Sometimes link text is in .string or .next_sibling
             if link_el.string and str(link_el.string).strip().startswith("http"):
                 return str(link_el.string).strip()
-            # BS4 sometimes puts URL as next_sibling NavigableString
             if link_el.next_sibling:
                 sib = str(link_el.next_sibling).strip()
                 if sib.startswith("http"):
@@ -209,7 +208,6 @@ class TassScraper(BaseScraper):
             if href:
                 return href.strip()
 
-        # Method 2: <guid> as URL
         guid_el = item.find("guid")
         if guid_el:
             g = guid_el.get_text(strip=True)
@@ -223,7 +221,7 @@ class TassScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     def _fetch_html_listing(self, since: datetime, until: datetime) -> list[dict]:
-        """Scrape TASS homepage/listing pages for article links."""
+        """Scrape TASS section pages for article links."""
         stubs: list[dict] = []
         seen_links: set[str] = set()
 
@@ -238,10 +236,8 @@ class TassScraper(BaseScraper):
 
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Find article links — TASS uses various link patterns
             for a_tag in soup.find_all("a", href=True):
                 href = a_tag["href"]
-                # TASS article URLs: /section/12345678 or /category/section/12345678
                 if not re.match(r"^/[a-z-]+/\d{5,}$", href) and \
                    not re.match(r"^/[a-z-]+/[a-z-]+/\d{5,}$", href):
                     continue
@@ -253,7 +249,6 @@ class TassScraper(BaseScraper):
 
                 title = a_tag.get_text(strip=True) or ""
                 if len(title) < 5:
-                    # Try parent element for title
                     parent = a_tag.parent
                     if parent:
                         title = parent.get_text(strip=True)
@@ -271,11 +266,18 @@ class TassScraper(BaseScraper):
         return stubs
 
     # ------------------------------------------------------------------
-    # Full text extraction
+    # Full text extraction (Next.js aware)
     # ------------------------------------------------------------------
 
     def _fetch_article_text(self, url: str) -> str:
-        """Fetch full article text from a TASS article page."""
+        """Fetch full article text from a TASS article page.
+
+        TASS uses Next.js SSR — article text may be in:
+        1. Visible HTML (CSS selectors)
+        2. <script id="__NEXT_DATA__"> JSON blob
+        3. <script type="application/ld+json"> structured data
+        4. Raw page text (smart fallback)
+        """
         try:
             resp = self.session.get(url, timeout=self.timeout)
             resp.raise_for_status()
@@ -283,13 +285,28 @@ class TassScraper(BaseScraper):
             logger.debug("TASS: failed to fetch %s: %s", url, exc)
             return ""
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        html = resp.text
+        soup = BeautifulSoup(html, "html.parser")
 
-        # Remove noise
-        for tag in soup.select("script, style, nav, header, footer, aside, iframe, noscript"):
+        # --- Method 1: Extract from __NEXT_DATA__ (Next.js SSR) ---
+        text = self._extract_from_next_data(soup)
+        if text and len(text) > 150:
+            return text
+
+        # --- Method 2: Extract from JSON-LD ---
+        text = self._extract_from_jsonld(soup)
+        if text and len(text) > 150:
+            return text
+
+        # --- Method 3: Extract from raw JSON in page source ---
+        text = self._extract_from_page_json(html)
+        if text and len(text) > 150:
+            return text
+
+        # --- Method 4: CSS selectors (after removing noise) ---
+        for tag in soup.select("style, nav, iframe, noscript"):
             tag.decompose()
 
-        # TASS-specific selectors (try in priority order)
         for selector in (
             "div.text-block",
             "div.text-content",
@@ -304,7 +321,7 @@ class TassScraper(BaseScraper):
                 if text and len(text) > 150:
                     return text
 
-        # Try collecting ALL div.text-block elements (TASS splits content)
+        # Multiple text-block elements
         text_blocks = soup.select("div.text-block")
         if text_blocks:
             combined = "\n".join(
@@ -314,12 +331,15 @@ class TassScraper(BaseScraper):
             if len(combined) > 150:
                 return combined
 
-        # Smart fallback: largest text-dense block
+        # --- Method 5: Smart fallback — largest text-dense block ---
+        for tag in soup.select("script, header, footer, aside"):
+            tag.decompose()
+
         text = _extract_largest_text_block(soup)
         if text and len(text) > 200:
             return text
 
-        # Last resort: all substantial <p> tags in body
+        # --- Method 6: All substantial <p> tags ---
         body = soup.find("body")
         if body:
             paragraphs = body.find_all("p")
@@ -330,5 +350,99 @@ class TassScraper(BaseScraper):
             )
             if len(p_text) > 200:
                 return p_text
+
+        return ""
+
+    def _extract_from_next_data(self, soup: BeautifulSoup) -> str:
+        """Extract article text from Next.js __NEXT_DATA__ JSON."""
+        script = soup.find("script", id="__NEXT_DATA__")
+        if not script or not script.string:
+            return ""
+
+        try:
+            data = json.loads(script.string)
+            # Walk the JSON tree looking for article text fields
+            return self._find_article_text_in_json(data)
+        except (json.JSONDecodeError, KeyError):
+            return ""
+
+    def _extract_from_jsonld(self, soup: BeautifulSoup) -> str:
+        """Extract article text from JSON-LD structured data."""
+        for script in soup.find_all("script", type="application/ld+json"):
+            if not script.string:
+                continue
+            try:
+                data = json.loads(script.string)
+                # Handle both single object and array
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    # articleBody is the standard Schema.org field
+                    body = item.get("articleBody", "")
+                    if body and len(body) > 100:
+                        return body
+                    # Try description as fallback
+                    desc = item.get("description", "")
+                    if desc and len(desc) > 200:
+                        return desc
+            except (json.JSONDecodeError, KeyError):
+                continue
+        return ""
+
+    def _extract_from_page_json(self, html: str) -> str:
+        """Try to find article text in inline JSON data in page source."""
+        # Look for patterns like "text":"..." or "body":"..." with substantial content
+        for pattern in (
+            r'"articleBody"\s*:\s*"((?:[^"\\]|\\.){200,})"',
+            r'"text"\s*:\s*"((?:[^"\\]|\\.){200,})"',
+            r'"body"\s*:\s*"((?:[^"\\]|\\.){200,})"',
+            r'"content"\s*:\s*"((?:[^"\\]|\\.){200,})"',
+        ):
+            m = re.search(pattern, html)
+            if m:
+                try:
+                    text = json.loads(f'"{m.group(1)}"')
+                    # Clean HTML if present
+                    if "<" in text:
+                        text = BeautifulSoup(text, "html.parser").get_text(
+                            separator="\n", strip=True
+                        )
+                    if len(text) > 150:
+                        return text
+                except (json.JSONDecodeError, ValueError):
+                    continue
+        return ""
+
+    def _find_article_text_in_json(self, data, depth: int = 0) -> str:
+        """Recursively search JSON for article text fields."""
+        if depth > 10:
+            return ""
+
+        if isinstance(data, dict):
+            # Direct text fields
+            for key in ("articleBody", "text", "body", "content", "textHtml"):
+                val = data.get(key)
+                if isinstance(val, str) and len(val) > 150:
+                    if "<" in val:
+                        val = BeautifulSoup(val, "html.parser").get_text(
+                            separator="\n", strip=True
+                        )
+                    if len(val) > 150:
+                        return val
+
+            # Recurse into child dicts/lists
+            for key, val in data.items():
+                if isinstance(val, (dict, list)):
+                    result = self._find_article_text_in_json(val, depth + 1)
+                    if result:
+                        return result
+
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, (dict, list)):
+                    result = self._find_article_text_in_json(item, depth + 1)
+                    if result:
+                        return result
 
         return ""
