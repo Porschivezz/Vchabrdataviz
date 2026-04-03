@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     # --- Proxy (for scraping Russian sites behind geo-filters) ---
     scraper_proxy_url: str = ""
 
+    # --- RU News Collector (microservice on Russian VPS) ---
+    ru_collector_url: str = ""       # e.g. http://10.0.0.5:8100
+    ru_collector_token: str = ""     # shared API token
+
     # --- Admin ---
     admin_password: str = "changeme123"
 

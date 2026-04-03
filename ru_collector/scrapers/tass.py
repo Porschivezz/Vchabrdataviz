@@ -1,4 +1,4 @@
-"""ТАСС (tass.ru) — adapted from working production parser.
+"""ТАСС (tass.ru) — scraper for Russian VPS (direct access, no proxy).
 
 Uses RSS feeds (including section-specific) for article discovery,
 then fetches each article page and extracts text from <p> tags
@@ -16,15 +16,13 @@ from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
 
-from src.scrapers.base import BaseScraper, RawArticle
-from src.scrapers.rss_scraper import _ensure_tz, _parse_datetime
-from src.core.config import settings
+from ru_collector.scrapers.base import BaseScraper, RawArticle
+from ru_collector.scrapers.rss_scraper import _ensure_tz, _parse_datetime
 
 logger = logging.getLogger(__name__)
 
 TASS_HOME = "https://tass.ru"
 
-# RSS feeds — main + section-specific
 RSS_FEEDS = [
     f"{TASS_HOME}/rss/v2.xml",
     f"{TASS_HOME}/rss/v2.xml?sections=MEhvM9YoKE4",  # Политика
@@ -41,7 +39,6 @@ EXCLUDED_PREFIXES = (
 
 
 def _is_article_url(href: str) -> bool:
-    """Check if URL is a TASS article page."""
     if not href.startswith(TASS_HOME):
         return False
     path = href[len(TASS_HOME):]
@@ -51,49 +48,19 @@ def _is_article_url(href: str) -> bool:
 
 
 class TassScraper(BaseScraper):
-    """ТАСС — парсер на основе рабочего продакшн-парсера.
-
-    TASS's DDoS-Guard blocks many proxy IPs. We use two sessions:
-    - direct session (no proxy) for RSS discovery + article fetches
-    - proxy session as fallback if direct access fails
-    """
+    """ТАСС — runs directly from Russian VPS, no proxy needed."""
 
     def __init__(self, timeout: int = 30) -> None:
         self.timeout = timeout
-        headers = {
+        self.session = requests.Session()
+        self.session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        }
-
-        # Direct session (no proxy) — preferred for TASS
-        self.session = requests.Session()
-        self.session.headers.update(headers)
-
-        # Proxy session as fallback
-        self._proxy_session: requests.Session | None = None
-        proxy_url = settings.scraper_proxy_url.strip()
-        if proxy_url:
-            self._proxy_session = requests.Session()
-            self._proxy_session.headers.update(headers)
-            self._proxy_session.proxies.update({"http": proxy_url, "https": proxy_url})
-
-    def _get(self, url: str, **kwargs) -> requests.Response:
-        """GET with fallback: try direct first, then proxy."""
-        kwargs.setdefault("timeout", self.timeout)
-        try:
-            resp = self.session.get(url, **kwargs)
-            if resp.status_code == 403 and self._proxy_session:
-                logger.debug("TASS: direct 403 for %s, trying proxy", url)
-                resp = self._proxy_session.get(url, **kwargs)
-            return resp
-        except requests.RequestException:
-            if self._proxy_session:
-                return self._proxy_session.get(url, **kwargs)
-            raise
+        })
 
     def fetch_articles(
         self,
@@ -104,16 +71,13 @@ class TassScraper(BaseScraper):
         since_aware = _ensure_tz(since)
         until_aware = _ensure_tz(until) if until else datetime.now(timezone.utc)
 
-        # Step 1: Discover article URLs from all RSS feeds
         discovered = self._discover_from_rss(since_aware, until_aware)
         logger.info("TASS: discovered %d article URLs from RSS", len(discovered))
 
         if not discovered:
-            # Fallback to HTML listing
             discovered = self._discover_from_html(since_aware, until_aware)
             logger.info("TASS: discovered %d URLs from HTML listing", len(discovered))
 
-        # Step 2: Fetch and parse each article
         articles: list[RawArticle] = []
         for i, stub in enumerate(discovered):
             article = self._parse_article(stub, since_aware, until_aware)
@@ -135,19 +99,17 @@ class TassScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     def _discover_from_rss(self, since: datetime, until: datetime) -> list[dict]:
-        """Discover article URLs from multiple RSS feeds."""
         stubs: list[dict] = []
         seen: set[str] = set()
 
         for feed_url in RSS_FEEDS:
             try:
-                resp = self._get(feed_url)
+                resp = self.session.get(feed_url, timeout=self.timeout)
                 resp.raise_for_status()
             except requests.RequestException as exc:
                 logger.debug("TASS RSS %s failed: %s", feed_url, exc)
                 continue
 
-            # Parse as XML first, fallback to html.parser
             soup = BeautifulSoup(resp.content, "xml")
             items = soup.find_all("item")
             if not items:
@@ -155,7 +117,6 @@ class TassScraper(BaseScraper):
                 items = soup.find_all("item")
 
             for item in items:
-                # Extract link
                 link = ""
                 link_el = item.find("link")
                 if link_el:
@@ -163,7 +124,6 @@ class TassScraper(BaseScraper):
                             or (link_el.string and str(link_el.string).strip())
                             or "")
                 if not link:
-                    # In html.parser, <link> is void — URL is next text node
                     if link_el and link_el.next_sibling:
                         sib = str(link_el.next_sibling).strip()
                         if sib.startswith("http"):
@@ -179,7 +139,6 @@ class TassScraper(BaseScraper):
                     continue
                 seen.add(link)
 
-                # Extract date
                 pub_dt = None
                 for tag_name in ("pubDate", "published", "updated"):
                     el = item.find(tag_name)
@@ -203,7 +162,6 @@ class TassScraper(BaseScraper):
         return stubs
 
     def _discover_from_html(self, since: datetime, until: datetime) -> list[dict]:
-        """Fallback: scrape TASS section pages for article links."""
         stubs: list[dict] = []
         seen: set[str] = set()
 
@@ -214,7 +172,7 @@ class TassScraper(BaseScraper):
         for section in sections:
             url = f"{TASS_HOME}{section}"
             try:
-                resp = self._get(url)
+                resp = self.session.get(url, timeout=self.timeout)
                 resp.raise_for_status()
             except requests.RequestException:
                 continue
@@ -236,15 +194,14 @@ class TassScraper(BaseScraper):
         return stubs
 
     # ------------------------------------------------------------------
-    # Article parsing (adapted from working production parser)
+    # Article parsing
     # ------------------------------------------------------------------
 
     def _parse_article(self, stub: dict, since: datetime, until: datetime) -> RawArticle | None:
-        """Fetch and parse a single TASS article page."""
         url = stub["link"]
 
         try:
-            resp = self._get(url)
+            resp = self.session.get(url, timeout=self.timeout)
             resp.raise_for_status()
         except requests.RequestException as exc:
             logger.debug("TASS article %s failed: %s", url, exc)
@@ -277,7 +234,7 @@ class TassScraper(BaseScraper):
                 if og:
                     title = og.get("content", "")
 
-        # --- Lead/subtitle ---
+        # --- Lead ---
         lead = ""
         for sel in ("div.news-header__lead", "div[class*='lead']", "p.lead"):
             el = soup.select_one(sel)
@@ -285,11 +242,9 @@ class TassScraper(BaseScraper):
                 lead = el.get_text(strip=True)
                 break
 
-        # --- Body text: extract <p> tags from known content containers ---
-        # (adapted from working parser's content_nodes logic)
+        # --- Body text ---
         paragraphs: list[str] = []
 
-        # Try each container selector
         for container_sel in (
             "div.text-content",
             "div.news-body",
@@ -302,7 +257,6 @@ class TassScraper(BaseScraper):
                 continue
 
             for p in container.find_all("p"):
-                # Skip captions, promos, ads
                 parent = p.parent
                 if parent:
                     parent_class = " ".join(parent.get("class", []))
@@ -315,7 +269,7 @@ class TassScraper(BaseScraper):
                     paragraphs.append(text)
 
             if paragraphs:
-                break  # Found content, stop trying selectors
+                break
 
         body_text = "\n\n".join(paragraphs)
 
@@ -335,7 +289,6 @@ class TassScraper(BaseScraper):
                 except (json.JSONDecodeError, KeyError):
                     continue
 
-        # Combine lead + body
         if lead and lead not in body_text:
             body_text = f"{lead}\n\n{body_text}" if body_text else lead
 
@@ -344,7 +297,6 @@ class TassScraper(BaseScraper):
         if not pub_dt:
             pub_dt = self._extract_date(soup)
 
-        # Date filter
         if pub_dt:
             pub_aware = _ensure_tz(pub_dt)
             if pub_aware > until or pub_aware < since:
@@ -360,7 +312,6 @@ class TassScraper(BaseScraper):
             if t:
                 tags.append(t)
 
-        # Section from URL
         m = re.search(r"tass\.ru/([\w-]+)/", url)
         if m:
             tags.insert(0, m.group(1))
@@ -375,15 +326,12 @@ class TassScraper(BaseScraper):
         )
 
     def _extract_date(self, soup: BeautifulSoup) -> datetime | None:
-        """Extract publication date from article page."""
-        # time[datetime]
         time_el = soup.find("time", attrs={"datetime": True})
         if time_el:
             dt = _parse_datetime(time_el["datetime"])
             if dt:
                 return dt
 
-        # TASS date selectors
         for sel in (
             "span.news-header__date",
             "div.news-header__date",
@@ -396,14 +344,12 @@ class TassScraper(BaseScraper):
                 if dt:
                     return dt
 
-        # meta article:published_time
         meta = soup.find("meta", attrs={"property": "article:published_time"})
         if meta:
             dt = _parse_datetime(meta.get("content", ""))
             if dt:
                 return dt
 
-        # JSON-LD datePublished
         for script in soup.find_all("script", type="application/ld+json"):
             if not script.string:
                 continue
