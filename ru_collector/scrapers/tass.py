@@ -1,12 +1,18 @@
-"""ТАСС (tass.ru) — advanced scraper for Russian VPS.
+"""ТАСС (tass.ru) — advanced scraper with Apify cloud rendering.
 
 Architecture notes (from site analysis):
 - Discovery: RSS feeds work perfectly (/rss/v2.xml + section feeds)
 - Article pages: Next.js/React SPA with obfuscated CSS classes
   (Text-module_root__..., text-block, etc.)
-- WAF: Servicepipe/Qrator with TLS fingerprinting + JS challenge + ASN blocking
-- Best text sources (in priority order):
-  1. __NEXT_DATA__ JSON embedded in page (contains full article text)
+- WAF: Servicepipe/Qrator with 4 protection layers:
+  1. TLS fingerprinting (blocks requests/httpx)
+  2. JS challenge (blocks curl_cffi)
+  3. Browser fingerprinting (blocks headless Playwright/Selenium)
+  4. ASN/IP blocking (blocks all datacenter IPs)
+
+Text extraction strategy (priority order):
+  0. Apify Web Scraper — cloud Chromium + residential proxy (bypasses all 4 layers)
+  1. __NEXT_DATA__ JSON embedded in page
   2. JSON-LD structured data (articleBody)
   3. Wildcard CSS selectors for obfuscated class names
   4. AMP page versions (/amp/ prefix)
@@ -27,6 +33,7 @@ from bs4 import BeautifulSoup, Tag
 
 from ru_collector.scrapers.base import BaseScraper, RawArticle
 from ru_collector.scrapers.rss_scraper import _ensure_tz, _parse_datetime
+from ru_collector.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +104,7 @@ def _is_junk_container(el: Tag) -> bool:
 
 
 class TassScraper(BaseScraper):
-    """ТАСС — multi-strategy text extraction."""
+    """ТАСС — multi-strategy text extraction with Apify cloud rendering."""
 
     def __init__(self, timeout: int = 30) -> None:
         self.timeout = timeout
@@ -111,6 +118,16 @@ class TassScraper(BaseScraper):
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         })
 
+        # Apify client for cloud-rendered page fetching
+        self._apify_client = None
+        if settings.apify_token:
+            try:
+                from apify_client import ApifyClient
+                self._apify_client = ApifyClient(settings.apify_token)
+                logger.info("TASS: Apify client initialized")
+            except ImportError:
+                logger.warning("TASS: apify-client not installed, Apify strategy disabled")
+
     def fetch_articles(
         self,
         *,
@@ -120,7 +137,7 @@ class TassScraper(BaseScraper):
         since_aware = _ensure_tz(since)
         until_aware = _ensure_tz(until) if until else datetime.now(timezone.utc)
 
-        # Discover from RSS (always works)
+        # Discover from RSS (always works — RSS is unprotected)
         discovered = self._discover_from_rss(since_aware, until_aware)
         logger.info("TASS: discovered %d article URLs from RSS", len(discovered))
 
@@ -128,21 +145,133 @@ class TassScraper(BaseScraper):
             discovered = self._discover_from_html(since_aware, until_aware)
             logger.info("TASS: discovered %d URLs from HTML listing", len(discovered))
 
+        # Pre-fetch article pages via Apify in batch (much more efficient)
+        apify_html_cache: dict[str, str] = {}
+        if self._apify_client and discovered:
+            urls = [s["link"] for s in discovered]
+            apify_html_cache = self._apify_batch_fetch(urls)
+            logger.info("TASS: Apify pre-fetched %d/%d pages", len(apify_html_cache), len(urls))
+
         articles: list[RawArticle] = []
         for i, stub in enumerate(discovered):
-            article = self._parse_article(stub, since_aware, until_aware)
+            article = self._parse_article(stub, since_aware, until_aware, apify_html_cache)
             if article:
                 articles.append(article)
 
             if (i + 1) % 20 == 0:
                 logger.info("TASS: parsed %d/%d, accepted %d",
                             i + 1, len(discovered), len(articles))
-            if (i + 1) % 5 == 0:
+            if not apify_html_cache and (i + 1) % 5 == 0:
                 time.sleep(0.3)
 
         full_count = sum(1 for a in articles if len(a.raw_text) > 300)
         logger.info("TASS TOTAL: %d articles, %d with full text", len(articles), full_count)
         return articles
+
+    # ------------------------------------------------------------------
+    # Apify cloud rendering (Strategy 0 — bypasses all WAF layers)
+    # ------------------------------------------------------------------
+
+    def _apify_batch_fetch(self, urls: list[str]) -> dict[str, str]:
+        """Use Apify Web Scraper to fetch rendered HTML of article pages.
+
+        Returns {url: rendered_html} dict.
+        Apify runs a real Chromium browser with residential proxies,
+        bypassing Servicepipe WAF (TLS fingerprint, JS challenge, ASN block).
+        """
+        if not self._apify_client:
+            return {}
+
+        # Limit batch size for cost control
+        max_pages = settings.apify_max_pages_per_run
+        batch_urls = urls[:max_pages]
+
+        # Use apify/web-scraper Actor — renders JS via Chromium
+        # pageFunction extracts the full rendered HTML
+        run_input = {
+            "startUrls": [{"url": u} for u in batch_urls],
+            "pageFunction": """async function pageFunction(context) {
+                const { page, request } = context;
+                // Wait for content to render
+                await page.waitForTimeout(3000);
+                // Try waiting for article content
+                try {
+                    await page.waitForSelector(
+                        'article, [class*="NewsBody"], [class*="text-content"], [class*="Text-module"]',
+                        { timeout: 10000 }
+                    );
+                } catch(e) {}
+                // Get full rendered HTML
+                const html = await page.content();
+                // Also try to grab text directly from DOM for reliability
+                const text = await page.evaluate(() => {
+                    // Try multiple selectors
+                    const selectors = [
+                        '[class*="text-content"]',
+                        '[class*="Text-module"]',
+                        '[class*="NewsBody"]',
+                        '[class*="text-block"]',
+                        'article',
+                    ];
+                    for (const sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el && el.innerText && el.innerText.length > 200) {
+                            return el.innerText;
+                        }
+                    }
+                    // Fallback: all <p> text
+                    const ps = [...document.querySelectorAll('p')];
+                    return ps.map(p => p.innerText).filter(t => t.length > 20).join('\\n\\n');
+                });
+                return {
+                    url: request.url,
+                    html: html,
+                    extractedText: text,
+                    title: await page.title(),
+                };
+            }""",
+            "proxyConfiguration": {"useApifyProxy": True},
+            "maxRequestsPerCrawl": max_pages,
+            "maxConcurrency": 5,
+        }
+
+        try:
+            logger.info("TASS: launching Apify web-scraper for %d URLs...", len(batch_urls))
+            run = self._apify_client.actor("apify/web-scraper").call(
+                run_input=run_input,
+                timeout_secs=300,
+                memory_mbytes=2048,
+            )
+
+            if not run or run.get("status") != "SUCCEEDED":
+                logger.warning("TASS: Apify run did not succeed: %s",
+                               run.get("status") if run else "no run")
+                return {}
+
+            # Fetch results from dataset
+            dataset_id = run.get("defaultDatasetId")
+            if not dataset_id:
+                return {}
+
+            result_cache: dict[str, str] = {}
+            for item in self._apify_client.dataset(dataset_id).iterate_items():
+                url = item.get("url", "")
+                html = item.get("html", "")
+                text = item.get("extractedText", "")
+                if url:
+                    # Store the best content we got
+                    if html:
+                        result_cache[url] = html
+                    # Also store extracted text under a special key
+                    if text and len(text) > 100:
+                        result_cache[f"__text__{url}"] = text
+
+            logger.info("TASS: Apify returned %d page results", len(result_cache))
+            return result_cache
+
+        except Exception as exc:
+            logger.error("TASS: Apify batch fetch failed: %s", exc)
+            return {}
 
     # ------------------------------------------------------------------
     # RSS Discovery
@@ -289,12 +418,30 @@ class TassScraper(BaseScraper):
     # Article Parsing — multi-strategy text extraction
     # ------------------------------------------------------------------
 
-    def _parse_article(self, stub: dict, since: datetime, until: datetime) -> RawArticle | None:
+    def _parse_article(
+        self,
+        stub: dict,
+        since: datetime,
+        until: datetime,
+        apify_cache: dict[str, str] | None = None,
+    ) -> RawArticle | None:
         url = stub["link"]
         rss_text = stub.get("rss_text", "")
+        apify_cache = apify_cache or {}
 
-        # Try fetching article page
-        page_text, page_title, page_lead, pub_dt_page, tags = self._fetch_article_page(url)
+        # Strategy 0: Use Apify pre-fetched content (best quality)
+        apify_text = apify_cache.get(f"__text__{url}", "")
+        apify_html = apify_cache.get(url, "")
+
+        if apify_html:
+            # Parse the Apify-rendered HTML with our existing extractors
+            page_text, page_title, page_lead, pub_dt_page, tags = self._extract_from_html(apify_html)
+            # If Apify also extracted text directly from DOM, compare
+            if apify_text and len(apify_text) > len(page_text):
+                page_text = apify_text
+        else:
+            # Fallback: fetch page directly (may get WAF-blocked)
+            page_text, page_title, page_lead, pub_dt_page, tags = self._fetch_article_page(url)
 
         # Try AMP version if main page gave no text
         if len(page_text) < 200:
@@ -339,8 +486,16 @@ class TassScraper(BaseScraper):
             native_tags=tags,
         )
 
+    def _extract_from_html(self, html: str) -> tuple[str, str, str, datetime | None, list[str]]:
+        """Parse pre-fetched HTML (e.g. from Apify) and extract article data.
+
+        Returns (body_text, title, lead, published_at, tags).
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        return self._extract_from_soup(soup)
+
     def _fetch_article_page(self, url: str) -> tuple[str, str, str, datetime | None, list[str]]:
-        """Fetch article page and try all extraction strategies.
+        """Fetch article page via HTTP and try all extraction strategies.
 
         Returns (body_text, title, lead, published_at, tags).
         """
@@ -355,6 +510,10 @@ class TassScraper(BaseScraper):
 
         html = resp.text
         soup = BeautifulSoup(html, "html.parser")
+        return self._extract_from_soup(soup)
+
+    def _extract_from_soup(self, soup: BeautifulSoup) -> tuple[str, str, str, datetime | None, list[str]]:
+        """Core extraction logic from a parsed BeautifulSoup object."""
 
         # --- Title ---
         title = ""

@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8100
 
+    # Apify (for TASS and other JS-heavy sites behind WAF)
+    apify_token: str = ""
+    apify_max_pages_per_run: int = 50  # cost control
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
