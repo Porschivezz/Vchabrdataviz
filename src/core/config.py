@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     ru_collector_url: str = ""       # e.g. http://10.0.0.5:8100
     ru_collector_token: str = ""     # shared API token
 
+    # --- Apify (for TASS and other JS-heavy sites behind WAF) ---
+    apify_token: str = ""
+    apify_max_pages_per_run: int = 50
+
     # --- Admin ---
     admin_password: str = "changeme123"
 
