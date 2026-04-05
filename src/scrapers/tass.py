@@ -23,6 +23,7 @@ import json
 import logging
 import re
 import time
+import random
 from datetime import datetime, timezone
 
 import requests
@@ -104,8 +105,9 @@ class TassScraper(BaseScraper):
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         }
 
+        self._base_headers = headers
         self.session = requests.Session()
-        self.session.headers.update(headers)
+        self.session.headers.update(self._base_headers)
 
         self._proxy_session: requests.Session | None = None
         proxy_url = settings.scraper_proxy_url.strip()
@@ -150,11 +152,21 @@ class TassScraper(BaseScraper):
             if article:
                 articles.append(article)
 
-            if (i + 1) % 20 == 0:
+            if (i + 1) % 10 == 0:
                 logger.info("TASS: parsed %d/%d, accepted %d",
                             i + 1, len(discovered), len(articles))
-            if (i + 1) % 5 == 0:
-                time.sleep(0.3)
+            
+            # --- СТЕЛС-РЕЖИМ ---
+            time.sleep(random.uniform(1.5, 4.5))
+            
+            if (i + 1) % 12 == 0:
+                logger.debug("TASS: Rotating session to avoid WAF block...")
+                self.session.close()
+                self.session = requests.Session()
+                new_headers = self._base_headers.copy()
+                new_headers["User-Agent"] += f" (Helper/{random.randint(100, 999)})"
+                self.session.headers.update(new_headers)
+                time.sleep(random.uniform(5.0, 10.0))
 
         full_count = sum(1 for a in articles if len(a.raw_text) > 300)
         logger.info("TASS TOTAL: %d articles, %d with full text", len(articles), full_count)
@@ -525,87 +537,18 @@ class TassScraper(BaseScraper):
                 continue
         return best
 
-    def _extract_from_css_wildcards(self, soup: BeautifulSoup) -> str:
-        """Strategy 3: Wildcard CSS selectors for obfuscated TASS classes."""
-        wildcard_selectors = [
-            "div[class*='text-content']",
-            "div[class*='Text-module']",
-            "div[class*='text-block']",
-            "div[class*='TextBlock']",
-            "div[class*='NewsBody']",
-            "div[class*='news-body']",
-            "div[class*='ArticleBody']",
-            "div[class*='article-body']",
-            "div[class*='Article_text']",
-            "div[class*='Content_root']",
-            "div[class*='PageContent']",
-            "main[class*='content']",
-            "article[class*='Article']",
-            "article",
-        ]
-
-        best_text = ""
-        for sel in wildcard_selectors:
-            containers = soup.select(sel)
-            for container in containers:
-                if _is_junk_container(container):
-                    continue
-
-                paragraphs = []
-                for p in container.find_all("p", recursive=True):
-                    if p.parent and _is_junk_container(p.parent):
-                        continue
-                    text = p.get_text(strip=True)
-                    if text and len(text) > 20:
-                        paragraphs.append(text)
-
-                if not paragraphs:
-                    for child in container.find_all(["div", "span"], recursive=True):
-                        if _is_junk_container(child):
-                            continue
-                        if child.find(["div", "span", "p"]):
-                            continue
-                        text = child.get_text(strip=True)
-                        if text and len(text) > 30:
-                            paragraphs.append(text)
-
-                cleaned = _clean_paragraphs(paragraphs)
-                result = "\n\n".join(cleaned)
-                if len(result) > len(best_text):
-                    best_text = result
-
-            if len(best_text) > 300:
-                break
-
-        return best_text
-
-    def _extract_classic(self, soup: BeautifulSoup) -> str:
-        """Strategy 4: Classic container + <p> tag extraction."""
-        for container_sel in (
-            "div.text-content",
-            "div.news-body",
-            "div[class*='NewsBody']",
-            "article",
-            "main",
-            "div[class*='text']",
-        ):
-            container = soup.select_one(container_sel)
-            if not container or _is_junk_container(container):
-                continue
-
-            paragraphs = []
-            for p in container.find_all("p"):
-                if p.parent and _is_junk_container(p.parent):
-                    continue
-                text = p.get_text(strip=True)
-                if text and len(text) > 20:
-                    paragraphs.append(text)
-
-            cleaned = _clean_paragraphs(paragraphs)
-            if cleaned:
-                return "\n\n".join(cleaned)
-
+    def _extract_from_css_wildcards(self, soup):
         return ""
+
+    def _extract_classic(self, soup):
+        paragraphs = []
+        for p in soup.find_all("p"):
+            if p.parent and _is_junk_container(p.parent):
+                continue
+            text = p.get_text(separator=" ", strip=True)
+            if len(text) > 40 and "Читайте также" not in text:
+                paragraphs.append(text)
+        return "\n\n".join(paragraphs)
 
     def _fetch_amp_page(self, url: str) -> str:
         """Try AMP version of article for simpler HTML."""
